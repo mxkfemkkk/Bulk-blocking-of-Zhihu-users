@@ -11,14 +11,27 @@
     console.log(`你输入的ID是：${MY_USER_ID}`);
 
     const pageHref = location.href;
+    let votersApi = null;
+    let contentId = null;
+    let contentType = '';
+
     const answerMatch = pageHref.match(/^https:\/\/www\.zhihu\.com\/question\/(\d+)\/answer\/(\d+)/);
-    if (!answerMatch) {
-        console.error('当前页面不是知乎回答页，请在回答页面运行此脚本。');
+    const articleMatch = pageHref.match(/^https:\/\/zhuanlan\.zhihu\.com\/p\/(\d+)/);
+
+    if (answerMatch) {
+        contentType = '回答';
+        contentId = answerMatch[2];
+        votersApi = `https://www.zhihu.com/api/v4/answers/${contentId}/upvoters`;
+        console.log(`识别为【回答】页面，ID: ${contentId}`);
+    } else if (articleMatch) {
+        contentType = '文章';
+        contentId = articleMatch[1];
+        votersApi = `https://www.zhihu.com/api/v4/articles/${contentId}/voters`;
+        console.log(`识别为【文章】页面，ID: ${contentId}`);
+    } else {
+        console.error('当前页面不是知乎回答或文章页，请在正确的页面运行此脚本。');
         return;
     }
-    const targetAnswerId = answerMatch[2];
-    const votersApi = `https://www.zhihu.com/api/v4/answers/${targetAnswerId}/upvoters`;
-
     async function getAllUserIds(apiUrl) {
         let allIds = new Set();
         let offset = 0;
@@ -55,15 +68,13 @@
         border: 1px solid #0f0;
     `;
     document.body.appendChild(infoDiv);
-    infoDiv.innerHTML = '<b>正在获取你的关注和粉丝列表...</b><br>';
-
+    infoDiv.innerHTML = '<b>正在获取你的关注和粉丝列表（拉黑过程中会跳过这些人），这一过程时间较长，耐心等待...</b><br>';
     const followees = await getAllUserIds(`https://www.zhihu.com/api/v4/members/${MY_USER_ID}/followees`);
     const followers = await getAllUserIds(`https://www.zhihu.com/api/v4/members/${MY_USER_ID}/followers`);
     const safeUserIds = new Set([...followees, ...followers]);
 
     infoDiv.innerHTML = `<b>已加载安全列表：${safeUserIds.size} 人 (关注 + 粉丝)</b><br><hr>`;
     console.log(`已加载安全列表：${safeUserIds.size} 人 (关注 + 粉丝)`);
-
     const blockedUsers = [];
     const sleep = timeout => new Promise(done => setTimeout(done, timeout));
 
@@ -90,16 +101,36 @@
                 const userName = voterInfo.name;
                 const userToken = voterInfo.url_token;
                 const profileUrl = `https://www.zhihu.com${voterInfo.url}`;
-
-                // 检查是否在安全列表中
                 if (safeUserIds.has(userId)) {
                     infoDiv.innerHTML += `跳过 (关注/粉丝)：${userName} (${handledUsers}/${estimatedUsers})<br>`;
                     infoDiv.scrollTop = infoDiv.scrollHeight;
                     console.log(`[${handledUsers}/${estimatedUsers}] 跳过 ${userName} (在安全列表中)`);
                     continue;
                 }
+                const isDefaultName = /^知乎用户[A-Za-z0-9]+$/.test(userName);
+                let isInactiveAndDefault = false;
 
-                // 执行拉黑
+                if (isDefaultName) {
+                    try {
+                        const activityUrl = `https://www.zhihu.com/api/v4/members/${userToken}/activities?limit=1`;
+                        const activityResponse = await fetch(activityUrl);
+                        const activityData = await activityResponse.json();
+                        if (activityData.data && activityData.data.length === 0) {
+                            isInactiveAndDefault = true;
+                        }
+                    } catch (e) {
+                        console.error(`获取用户 ${userName} 动态失败:`, e);
+                        isInactiveAndDefault = false;
+                    }
+                }
+
+                if (isDefaultName && isInactiveAndDefault) {
+                    infoDiv.innerHTML += `⏭跳过疑似小号（无动态且默认名）：${userName} (${handledUsers}/${estimatedUsers})<br>`;
+                    infoDiv.scrollTop = infoDiv.scrollHeight;
+                    console.log(`[${handledUsers}/${estimatedUsers}] 跳过疑似小号：${userName} (无动态且默认名)`);
+                    continue; // 跳过拉黑
+                }
+
                 const actionUrl = `https://www.zhihu.com/api/v4/members/${userToken}/actions/block`;
                 infoDiv.scrollTop = infoDiv.scrollHeight;
 
@@ -113,7 +144,7 @@
                 infoDiv.scrollTop = infoDiv.scrollHeight;
                 console.log(`[${handledUsers}/${estimatedUsers}] ${userName} -> ${actionResponse.ok ? '成功' : '失败'}`);
 
-                await sleep(1000);
+                await sleep(1000); // 每个用户拉黑后等待1秒，避免API限频
             }
 
             reachedLastPage = !!(listPayload.paging && listPayload.paging.is_end);
@@ -123,6 +154,5 @@
             break;
         }
     }
-
     infoDiv.innerHTML += `<hr><b>全部完成！共屏蔽 ${blockedUsers.length} 人</b><br>`;
 })();
