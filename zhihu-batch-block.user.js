@@ -254,7 +254,7 @@
                     console.warn(`拉黑失败 ${userName}: ${actionResponse.status} - ${errText}`);
                 }
 
-                await sleep(1000);
+                //await sleep(1000);
             }
 
             if (shouldStop) break;
