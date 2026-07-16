@@ -1,4 +1,18 @@
-(async () => {
+// ==UserScript==
+// @name         Block Zhihu User
+// @namespace    http://tampermonkey.net/
+// @version      2026-07-16
+// @description  知乎批量拉黑工具（点赞者 / 答主粉丝）
+// @author       maxkk26
+// @match        https://*/*
+// @icon         data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // ---------- 工具函数 ----------
     const fetchWithCreds = (url, options = {}) => {
         return fetch(url, {
             ...options,
@@ -21,8 +35,8 @@
         try {
             return JSON.parse(text);
         } catch (e) {
-            console.warn('JSON 解析失败，原始内容:', text.substring(0, 200));
-            throw new Error('JSON 解析失败: ' + e.message);
+            console.warn('JSON parse failed:', text.substring(0, 200));
+            throw new Error('JSON parse failed: ' + e.message);
         }
     };
 
@@ -30,7 +44,7 @@
         try {
             if (window.__INITIAL_STATE__?.config?.currentUser?.urlToken) {
                 const userId = window.__INITIAL_STATE__.config.currentUser.urlToken;
-                console.log(`自动检测到用户ID: ${userId}`);
+                console.log(`Auto detected user ID: ${userId}`);
                 return userId;
             }
         } catch (e) {}
@@ -39,53 +53,22 @@
             const response = await fetchWithCreds('https://www.zhihu.com/api/v4/me');
             const data = await safeJson(response);
             if (data && data.url_token) {
-                console.log(`通过API获取用户ID: ${data.url_token}`);
+                console.log(`Got user ID via API: ${data.url_token}`);
                 return data.url_token;
             }
         } catch (e) {
-            console.warn('通过API获取用户信息失败:', e);
+            console.warn('Failed to get user info via API:', e);
         }
 
-        const manualInput = prompt('无法自动获取用户ID，请手动输入你的知乎ID：');
+        const manualInput = prompt('Cannot auto detect user ID, please enter your Zhihu ID manually:');
         if (manualInput) {
-            console.log(`手动输入: ${manualInput}`);
+            console.log(`Manual input: ${manualInput}`);
             return manualInput;
         }
         return null;
     }
 
-    const MY_USER_ID = await getCurrentUserId();
-    if (!MY_USER_ID) {
-        console.error('无法获取知乎ID，脚本已终止。');
-        return;
-    }
-
-    const pageHref = location.href;
-    let apiCandidates = [];
-    let contentType = '';
-    let contentId = '';
-
-    const answerMatch = pageHref.match(/^https:\/\/www\.zhihu\.com\/question\/(\d+)\/answer\/(\d+)/);
-    const articleMatch = pageHref.match(/^https:\/\/zhuanlan\.zhihu\.com\/p\/(\d+)/);
-
-    if (answerMatch) {
-        contentType = '回答';
-        contentId = answerMatch[2];
-        apiCandidates = [`https://www.zhihu.com/api/v4/answers/${contentId}/upvoters`];
-        console.log(`识别为【回答】页面，ID: ${contentId}`);
-    } else if (articleMatch) {
-        contentType = '文章';
-        contentId = articleMatch[1];
-        apiCandidates = [
-            `https://www.zhihu.com/api/v4/articles/${contentId}/voters`,
-            `https://www.zhihu.com/api/v4/articles/${contentId}/likers`
-        ];
-        console.log(`识别为【文章】页面，ID: ${contentId}`);
-    } else {
-        console.error('当前页面不是知乎回答或文章页。');
-        return;
-    }
-
+    // 获取所有关注/粉丝ID（白名单）
     async function getAllUserIds(apiUrl) {
         let allIds = new Set();
         let offset = 0;
@@ -103,179 +86,447 @@
                 isEnd = data.paging && data.paging.is_end;
                 offset += limit;
             } catch (e) {
-                console.error(`获取数据失败 (${url}):`, e);
+                console.error(`Failed to fetch data (${url}):`, e);
                 break;
             }
         }
         return allIds;
     }
 
-    const infoDiv = document.createElement('div');
-    infoDiv.style.cssText = `
-        position: fixed; top: 10px; right: 10px; z-index: 9999;
-        background: #fff; color: #000; padding: 12px 20px;
-        border-radius: 4px; font-family: '微软雅黑', sans-serif; font-size: 14px;
-        max-height: 500px; overflow: hidden;
-        width: 420px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-        border: 1px solid #999;
-        display: flex; flex-direction: column;
-    `;
-    document.body.appendChild(infoDiv);
+    // ---------- 拉黑点赞者（已删除小号判断） ----------
+    async function blockUpvoters() {
+        const MY_USER_ID = await getCurrentUserId();
+        if (!MY_USER_ID) {
+            console.error('Cannot get user ID, abort.');
+            return;
+        }
 
-    const logArea = document.createElement('div');
-    logArea.style.cssText = 'flex: 1; overflow-y: auto; white-space: pre-wrap; padding-bottom: 8px;';
-    infoDiv.appendChild(logArea);
+        const pageHref = location.href;
+        let apiCandidates = [];
+        let contentType = '';
+        let contentId = '';
 
-    const btnContainer = document.createElement('div');
-    btnContainer.style.textAlign = 'center';
-    const stopBtn = document.createElement('button');
-    stopBtn.textContent = '停止';
-    stopBtn.style.padding = '4px 16px';
-    btnContainer.appendChild(stopBtn);
-    infoDiv.appendChild(btnContainer);
+        const answerMatch = pageHref.match(/^https:\/\/www\.zhihu\.com\/question\/(\d+)\/answer\/(\d+)/);
+        const articleMatch = pageHref.match(/^https:\/\/zhuanlan\.zhihu\.com\/p\/(\d+)/);
 
-    let shouldStop = false;
-    stopBtn.addEventListener('click', () => {
-        shouldStop = true;
-        console.log('用户请求停止，将在下一个用户处理前终止。');
-    });
+        if (answerMatch) {
+            contentType = 'answer';
+            contentId = answerMatch[2];
+            apiCandidates = [`https://www.zhihu.com/api/v4/answers/${contentId}/upvoters`];
+        } else if (articleMatch) {
+            contentType = 'article';
+            contentId = articleMatch[1];
+            apiCandidates = [
+                `https://www.zhihu.com/api/v4/articles/${contentId}/voters`,
+                `https://www.zhihu.com/api/v4/articles/${contentId}/likers`
+            ];
+        } else {
+            alert('Current page is not a Zhihu answer or article.');
+            return;
+        }
 
-    function appendLog(html) {
-        logArea.innerHTML += html + '<br>';
-        logArea.scrollTop = logArea.scrollHeight;
-    }
+        // 白名单
+        const followees = await getAllUserIds(`https://www.zhihu.com/api/v4/members/${MY_USER_ID}/followees`);
+        const followers = await getAllUserIds(`https://www.zhihu.com/api/v4/members/${MY_USER_ID}/followers`);
+        const safeUserIds = new Set([...followees, ...followers]);
 
-    function tokenLink(userToken) {
-        return `<a href="https://www.zhihu.com/people/${userToken}" target="_blank">${userToken}</a>`;
-    }
+        // UI 进度框
+        const infoDiv = document.createElement('div');
+        infoDiv.style.cssText = `
+            position: fixed; top: 10px; right: 10px; z-index: 9999;
+            background: #fff; color: #000; padding: 12px 20px;
+            border-radius: 4px; font-family: '微软雅黑', sans-serif; font-size: 14px;
+            max-height: 500px; overflow: hidden;
+            width: 420px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+            border: 1px solid #999;
+            display: flex; flex-direction: column;
+        `;
+        document.body.appendChild(infoDiv);
 
-    appendLog('正在获取你的关注和粉丝列表（白名单）...');
+        const logArea = document.createElement('div');
+        logArea.style.cssText = 'flex: 1; overflow-y: auto; white-space: pre-wrap; padding-bottom: 8px;';
+        infoDiv.appendChild(logArea);
 
-    const followees = await getAllUserIds(`https://www.zhihu.com/api/v4/members/${MY_USER_ID}/followees`);
-    const followers = await getAllUserIds(`https://www.zhihu.com/api/v4/members/${MY_USER_ID}/followers`);
-    const safeUserIds = new Set([...followees, ...followers]);
+        const btnContainer = document.createElement('div');
+        btnContainer.style.textAlign = 'center';
+        const stopBtn = document.createElement('button');
+        stopBtn.textContent = '停止';
+        stopBtn.style.padding = '4px 16px';
+        btnContainer.appendChild(stopBtn);
+        infoDiv.appendChild(btnContainer);
 
-    appendLog(`白名单：${safeUserIds.size} 人 (关注 + 粉丝)`);
-    appendLog('─────────────────────────────');
+        let shouldStop = false;
+        stopBtn.addEventListener('click', () => {
+            shouldStop = true;
+            console.log('User requested stop.');
+        });
 
-    const blockedUsers = [];
-    const sleep = timeout => new Promise(done => setTimeout(done, timeout));
+        function appendLog(html) {
+            logArea.innerHTML += html + '<br>';
+            logArea.scrollTop = logArea.scrollHeight;
+        }
 
-    let currentApiIndex = 0;
-    let votersApi = apiCandidates[0];
-    let pageOffset = 0;
-    let reachedLastPage = false;
-    let handledUsers = 0;
-    let estimatedUsers = 0;
+        function tokenLink(userToken) {
+            return `<a href="https://www.zhihu.com/people/${userToken}" target="_blank">${userToken}</a>`;
+        }
 
-    while (!reachedLastPage && !shouldStop) {
-        const requestUrl = `${votersApi}?limit=10&offset=${pageOffset}`;
-        try {
-            const listResponse = await fetchWithCreds(requestUrl);
-            const listPayload = await safeJson(listResponse);
-            if (!listPayload) {
-                if (currentApiIndex < apiCandidates.length - 1) {
+        appendLog('Getting your followees and followers (whitelist)...');
+        appendLog(`Whitelist: ${safeUserIds.size} people (followees + followers)`);
+        appendLog('─────────────────────────────');
+
+        const blockedUsers = [];
+        const sleep = timeout => new Promise(done => setTimeout(done, timeout));
+
+        let currentApiIndex = 0;
+        let votersApi = apiCandidates[0];
+        let pageOffset = 0;
+        let reachedLastPage = false;
+        let handledUsers = 0;
+        let estimatedUsers = 0;
+
+        while (!reachedLastPage && !shouldStop) {
+            const requestUrl = `${votersApi}?limit=10&offset=${pageOffset}`;
+            try {
+                const listResponse = await fetchWithCreds(requestUrl);
+                const listPayload = await safeJson(listResponse);
+                if (!listPayload) {
+                    if (currentApiIndex < apiCandidates.length - 1) {
+                        currentApiIndex++;
+                        votersApi = apiCandidates[currentApiIndex];
+                        appendLog(`Switched to fallback API: ${votersApi}`);
+                        continue;
+                    } else {
+                        appendLog('All APIs returned empty data, terminating.');
+                        break;
+                    }
+                }
+                const voterList = listPayload.data || [];
+                estimatedUsers += voterList.length;
+
+                for (const voterInfo of voterList) {
+                    if (shouldStop) {
+                        appendLog('Stopped by user.');
+                        break;
+                    }
+
+                    handledUsers++;
+                    const userId = voterInfo.id;
+                    const userName = voterInfo.name;
+                    const userToken = voterInfo.url_token;
+                    const profileUrl = `https://www.zhihu.com${voterInfo.url}`;
+
+                    // 只跳过白名单，不再进行小号判断
+                    if (safeUserIds.has(userId)) {
+                        appendLog(`Skipped (whitelist): ${userName} (${tokenLink(userToken)}) [${handledUsers}/${estimatedUsers}]`);
+                        continue;
+                    }
+
+                    // 直接拉黑
+                    const actionUrl = `https://www.zhihu.com/api/v4/members/${userToken}/actions/block`;
+                    const actionResponse = await fetchWithCreds(actionUrl, { method: 'POST' });
+                    if (actionResponse.ok) {
+                        blockedUsers.push({ userName, userToken, profileUrl });
+                        appendLog(`Blocked: ${userName} (${tokenLink(userToken)}) [${handledUsers}/${estimatedUsers}]`);
+                    } else {
+                        const errText = await actionResponse.text().catch(() => '');
+                        appendLog(`Failed: ${userName} (${tokenLink(userToken)}) status ${actionResponse.status}`);
+                        console.warn(`Block failed ${userName}: ${actionResponse.status} - ${errText}`);
+                    }
+                    await sleep(100);
+                }
+
+                if (shouldStop) break;
+                reachedLastPage = !!(listPayload.paging && listPayload.paging.is_end);
+                pageOffset += 10;
+            } catch (err) {
+                console.error('Main loop error:', err);
+                if (err.message && err.message.includes('405') && currentApiIndex < apiCandidates.length - 1) {
                     currentApiIndex++;
                     votersApi = apiCandidates[currentApiIndex];
-                    appendLog(`切换到备用 API: ${votersApi}`);
+                    appendLog(`Got 405, switched to fallback API: ${votersApi}`);
                     continue;
                 } else {
-                    appendLog('所有 API 均返回空数据，终止');
                     break;
                 }
             }
-            const voterList = listPayload.data || [];
-            estimatedUsers += voterList.length;
+        }
 
-            for (const voterInfo of voterList) {
-                if (shouldStop) {
-                    appendLog('已停止，不再继续处理。');
-                    break;
+        if (shouldStop) {
+            appendLog('User stopped, not fully completed.');
+        }
+        appendLog(`Done! Total blocked: ${blockedUsers.length}`);
+        console.log(`====== Blocked users (${contentType}) ======`);
+        console.table(blockedUsers);
+        console.log('Total blocked:', blockedUsers.length);
+    }
+
+    // ---------- 拉黑答主的粉丝（无小号判断，三次确认） ----------
+    async function blockAuthorFollowers() {
+        if (!confirm('警告：即将拉黑本回答/文章作者的粉丝。此操作不可逆，且会排除你的关注和粉丝。确定要继续吗？')) {
+            return;
+        }
+        if (!confirm('再次确认：确定要拉黑该答主的所有粉丝（排除你的关注和粉丝）吗？')) {
+            return;
+        }
+        if (!confirm('最后确认：此操作将会拉黑大量用户，请确保你已了解后果。确定执行？')) {
+            return;
+        }
+
+        const MY_USER_ID = await getCurrentUserId();
+        if (!MY_USER_ID) {
+            alert('无法获取你的用户ID，请重新登录后重试。');
+            return;
+        }
+
+        const pageHref = location.href;
+        let authorId = null;
+        let contentType = '';
+        let contentId = '';
+
+        const answerMatch = pageHref.match(/^https:\/\/www\.zhihu\.com\/question\/(\d+)\/answer\/(\d+)/);
+        const articleMatch = pageHref.match(/^https:\/\/zhuanlan\.zhihu\.com\/p\/(\d+)/);
+
+        if (answerMatch) {
+            contentType = 'answer';
+            contentId = answerMatch[2];
+            try {
+                const answerApi = `https://www.zhihu.com/api/v4/answers/${contentId}`;
+                const resp = await fetchWithCreds(answerApi);
+                const data = await safeJson(resp);
+                if (data && data.author && data.author.id) {
+                    authorId = data.author.id;
+                } else {
+                    alert('无法获取回答作者信息。');
+                    return;
                 }
-
-                handledUsers++;
-                const userId = voterInfo.id;
-                const userName = voterInfo.name;
-                const userToken = voterInfo.url_token;
-                const profileUrl = `https://www.zhihu.com${voterInfo.url}`;
-
-                if (safeUserIds.has(userId)) {
-                    appendLog(`跳过 (关注/粉丝)：${userName} (${tokenLink(userToken)}) [${handledUsers}/${estimatedUsers}]`);
-                    continue;
+            } catch (e) {
+                alert('获取回答作者失败：' + e.message);
+                return;
+            }
+        } else if (articleMatch) {
+            contentType = 'article';
+            contentId = articleMatch[1];
+            try {
+                const articleApi = `https://www.zhihu.com/api/v4/articles/${contentId}`;
+                const resp = await fetchWithCreds(articleApi);
+                const data = await safeJson(resp);
+                if (data && data.author && data.author.id) {
+                    authorId = data.author.id;
+                } else {
+                    alert('无法获取文章作者信息。');
+                    return;
                 }
+            } catch (e) {
+                alert('获取文章作者失败：' + e.message);
+                return;
+            }
+        } else {
+            alert('当前页面不是知乎回答或文章，无法执行此操作。');
+            return;
+        }
 
-                let isSuspectedSpam = false;
-                try {
-                    const userInfoUrl = `https://www.zhihu.com/api/v4/members/${userToken}`;
-                    const infoResponse = await fetchWithCreds(userInfoUrl);
-                    const infoData = await safeJson(infoResponse);
-                    if (infoData) {
-                        const createdAt = infoData.created_at;
-                        const followeeCount = infoData.followee_count;
-                        const now = Math.floor(Date.now() / 1000);
-                        const isOldEnough = (now - createdAt) > 7 * 24 * 3600;
-                        const hasFewFollowees = (followeeCount !== undefined && followeeCount <= 1);
+        // 获取白名单
+        const followees = await getAllUserIds(`https://www.zhihu.com/api/v4/members/${MY_USER_ID}/followees`);
+        const followers = await getAllUserIds(`https://www.zhihu.com/api/v4/members/${MY_USER_ID}/followers`);
+        const safeUserIds = new Set([...followees, ...followers]);
 
-                        let hasActivity = false;
-                        try {
-                            const activityUrl = `https://www.zhihu.com/api/v4/members/${userToken}/activities?limit=1`;
-                            const actResponse = await fetchWithCreds(activityUrl);
-                            const actData = await safeJson(actResponse);
-                            if (actData && actData.data && actData.data.length > 0) {
-                                hasActivity = true;
-                            }
-                        } catch (e) {
-                            console.warn(`获取 ${userName} 动态失败:`, e);
-                            hasActivity = true; // 保守认为有动态
-                        }
+        const fansApi = `https://www.zhihu.com/api/v4/members/${authorId}/followers`;
 
-                        if (isOldEnough && hasFewFollowees && !hasActivity) {
-                            isSuspectedSpam = true;
-                        }
+        // UI 进度框
+        const infoDiv = document.createElement('div');
+        infoDiv.style.cssText = `
+            position: fixed; top: 10px; right: 10px; z-index: 9999;
+            background: #fff; color: #000; padding: 12px 20px;
+            border-radius: 4px; font-family: '微软雅黑', sans-serif; font-size: 14px;
+            max-height: 500px; overflow: hidden;
+            width: 420px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+            border: 1px solid #999;
+            display: flex; flex-direction: column;
+        `;
+        document.body.appendChild(infoDiv);
+
+        const logArea = document.createElement('div');
+        logArea.style.cssText = 'flex: 1; overflow-y: auto; white-space: pre-wrap; padding-bottom: 8px;';
+        infoDiv.appendChild(logArea);
+
+        const btnContainer = document.createElement('div');
+        btnContainer.style.textAlign = 'center';
+        const stopBtn = document.createElement('button');
+        stopBtn.textContent = '停止';
+        stopBtn.style.padding = '4px 16px';
+        btnContainer.appendChild(stopBtn);
+        infoDiv.appendChild(btnContainer);
+
+        let shouldStop = false;
+        stopBtn.addEventListener('click', () => {
+            shouldStop = true;
+            console.log('User requested stop.');
+        });
+
+        function appendLog(html) {
+            logArea.innerHTML += html + '<br>';
+            logArea.scrollTop = logArea.scrollHeight;
+        }
+
+        function tokenLink(userToken) {
+            return `<a href="https://www.zhihu.com/people/${userToken}" target="_blank">${userToken}</a>`;
+        }
+
+        appendLog('Fetching author\'s followers (excluding your whitelist)...');
+        appendLog(`Whitelist: ${safeUserIds.size} people (your followees + followers)`);
+        appendLog('─────────────────────────────');
+
+        const blockedUsers = [];
+        const sleep = timeout => new Promise(done => setTimeout(done, timeout));
+
+        let offset = 0;
+        const limit = 20;
+        let isEnd = false;
+        let handled = 0;
+        let estimated = 0;
+
+        while (!isEnd && !shouldStop) {
+            const url = `${fansApi}?limit=${limit}&offset=${offset}`;
+            try {
+                const response = await fetchWithCreds(url);
+                const data = await safeJson(response);
+                if (!data) break;
+                const fans = data.data || [];
+                estimated += fans.length;
+
+                for (const fan of fans) {
+                    if (shouldStop) {
+                        appendLog('Stopped by user.');
+                        break;
                     }
-                } catch (e) {
-                    console.warn(`获取用户 ${userName} 信息失败:`, e);
+                    handled++;
+                    const userId = fan.id;
+                    const userName = fan.name;
+                    const userToken = fan.url_token;
+                    const profileUrl = `https://www.zhihu.com${fan.url}`;
+
+                    if (safeUserIds.has(userId)) {
+                        appendLog(`Skipped (whitelist): ${userName} (${tokenLink(userToken)}) [${handled}/${estimated}]`);
+                        continue;
+                    }
+
+                    const actionUrl = `https://www.zhihu.com/api/v4/members/${userToken}/actions/block`;
+                    const actionResponse = await fetchWithCreds(actionUrl, { method: 'POST' });
+                    if (actionResponse.ok) {
+                        blockedUsers.push({ userName, userToken, profileUrl });
+                        appendLog(`Blocked: ${userName} (${tokenLink(userToken)}) [${handled}/${estimated}]`);
+                    } else {
+                        const errText = await actionResponse.text().catch(() => '');
+                        appendLog(`Failed: ${userName} (${tokenLink(userToken)}) status ${actionResponse.status}`);
+                        console.warn(`Block failed ${userName}: ${actionResponse.status} - ${errText}`);
+                    }
+                    await sleep(100);
                 }
 
-                if (isSuspectedSpam) {
-                    appendLog(`跳过疑似小号：${userName} (${tokenLink(userToken)}) [${handledUsers}/${estimatedUsers}]`);
-                    continue;
-                }
-
-                const actionUrl = `https://www.zhihu.com/api/v4/members/${userToken}/actions/block`;
-                const actionResponse = await fetchWithCreds(actionUrl, { method: 'POST' });
-                if (actionResponse.ok) {
-                    blockedUsers.push({ userName, userToken, profileUrl });
-                    appendLog(`已屏蔽：${userName} (${tokenLink(userToken)}) [${handledUsers}/${estimatedUsers}]`);
-                } else {
-                    const errText = await actionResponse.text().catch(() => '');
-                    appendLog(`失败：${userName} (${tokenLink(userToken)}) 状态 ${actionResponse.status}`);
-                    console.warn(`拉黑失败 ${userName}: ${actionResponse.status} - ${errText}`);
-                }
-
-                await sleep(1000);
-            }
-
-            if (shouldStop) break;
-
-            reachedLastPage = !!(listPayload.paging && listPayload.paging.is_end);
-            pageOffset += 10;
-        } catch (err) {
-            console.error('主循环出错:', err);
-            if (err.message && err.message.includes('405') && currentApiIndex < apiCandidates.length - 1) {
-                currentApiIndex++;
-                votersApi = apiCandidates[currentApiIndex];
-                appendLog(`遇到405，切换到备用 API: ${votersApi}`);
-                continue;
-            } else {
+                if (shouldStop) break;
+                isEnd = data.paging && data.paging.is_end;
+                offset += limit;
+            } catch (e) {
+                console.error('Error fetching fans:', e);
+                appendLog('Error fetching fans: ' + e.message);
                 break;
             }
         }
+
+        if (shouldStop) {
+            appendLog('User stopped, not fully completed.');
+        }
+        appendLog(`Done! Total blocked: ${blockedUsers.length}`);
+        console.log('====== Blocked author\'s followers ======');
+        console.table(blockedUsers);
+        console.log('Total blocked:', blockedUsers.length);
     }
 
-    if (shouldStop) {
-        appendLog('用户主动停止，未完成全部处理。');
+    // ---------- 创建悬浮按钮和菜单 ----------
+    function createUI() {
+        const floatBtn = document.createElement('div');
+        floatBtn.style.cssText = `
+            position: fixed;
+            bottom: 80px;
+            right: 20px;
+            z-index: 99999;
+            background: #007bff;
+            color: #fff;
+            padding: 10px 14px;
+            border-radius: 50%;
+            font-size: 24px;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+            user-select: none;
+            font-family: '微软雅黑', sans-serif;
+            width: 48px;
+            height: 48px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: none;
+        `;
+        floatBtn.textContent = '⚙';
+        document.body.appendChild(floatBtn);
+
+        const menu = document.createElement('div');
+        menu.style.cssText = `
+            position: fixed;
+            bottom: 140px;
+            right: 20px;
+            z-index: 99999;
+            background: #fff;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+            padding: 8px 0;
+            min-width: 180px;
+            display: none;
+            font-family: '微软雅黑', sans-serif;
+            font-size: 14px;
+        `;
+        const item1 = document.createElement('div');
+        item1.textContent = '拉黑点赞者';
+        item1.style.cssText = 'padding: 8px 16px; cursor: pointer;';
+        item1.addEventListener('mouseenter', () => { item1.style.backgroundColor = '#f0f0f0'; });
+        item1.addEventListener('mouseleave', () => { item1.style.backgroundColor = 'transparent'; });
+        item1.addEventListener('click', () => {
+            menu.style.display = 'none';
+            blockUpvoters();
+        });
+
+        const item2 = document.createElement('div');
+        item2.textContent = '拉黑答主粉丝';
+        item2.style.cssText = 'padding: 8px 16px; cursor: pointer;';
+        item2.addEventListener('mouseenter', () => { item2.style.backgroundColor = '#f0f0f0'; });
+        item2.addEventListener('mouseleave', () => { item2.style.backgroundColor = 'transparent'; });
+        item2.addEventListener('click', () => {
+            menu.style.display = 'none';
+            blockAuthorFollowers();
+        });
+
+        menu.appendChild(item1);
+        menu.appendChild(item2);
+        document.body.appendChild(menu);
+
+        floatBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const isVisible = menu.style.display === 'block';
+            menu.style.display = isVisible ? 'none' : 'block';
+        });
+
+        document.addEventListener('click', (e) => {
+            if (!menu.contains(e.target) && e.target !== floatBtn) {
+                menu.style.display = 'none';
+            }
+        });
     }
-    appendLog(`全部完成！共屏蔽 ${blockedUsers.length} 人`);
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', createUI);
+    } else {
+        createUI();
+    }
 })();
