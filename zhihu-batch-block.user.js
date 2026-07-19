@@ -412,18 +412,19 @@
                         continue;
                     }
 
-                    const actionUrl = `https://www.zhihu.com/api/v4/members/${userToken}/actions/block`;
-                    const actionResponse = await fetchWithCreds(actionUrl, { method: 'POST' });
-                    if (actionResponse.ok) {
-                        blockedUsers.push({ userName, userToken, profileUrl });
-                        appendLog(`Blocked: ${userName} (${tokenLink(userToken)}) [${handled}/${estimated}]`);
-                    } else {
-                        const errText = await actionResponse.text().catch(() => '');
-                        appendLog(`Failed: ${userName} (${tokenLink(userToken)}) status ${actionResponse.status}`);
-                        console.warn(`Block failed ${userName}: ${actionResponse.status} - ${errText}`);
-                    }
-                    await sleep(100);
+                const actionUrl = `https://www.zhihu.com/api/v4/members/${userToken}/actions/block`;
+                const actionResponse = await fetchWithCreds(actionUrl, { method: 'POST' });
+                if (actionResponse.ok) {
+                    blockedUsers.push({ userName, userToken, profileUrl });
+                    appendLog(`已屏蔽：${userName} (${tokenLink(userToken)}) [${handledUsers}/${estimatedUsers}]`);
+                } else {
+                    const errText = await actionResponse.text().catch(() => '');
+                    appendLog(`失败：${userName} (${tokenLink(userToken)}) 状态 ${actionResponse.status}`);
+                    console.warn(`拉黑失败 ${userName}: ${actionResponse.status} - ${errText}`);
                 }
+
+                await sleep(1000);
+            }
 
                 if (shouldStop) break;
                 isEnd = data.paging && data.paging.is_end;
