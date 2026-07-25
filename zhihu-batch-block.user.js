@@ -34,6 +34,67 @@
     // 当前会话中的已拉黑 token 集合（快速查找，避免频繁读 localStorage）
     const blockedTokens = new Set(loadBlockedUsers().map(u => u.token));
 
+    // ---------- 检测知乎深色模式 ----------
+    function isDarkMode() {
+        return document.documentElement.getAttribute('data-theme') === 'dark' ||
+               document.documentElement.classList.contains('dark') ||
+               window.matchMedia('(prefers-color-scheme: dark)').matches;
+    }
+
+    // ---------- 获取深色模式下的信息框样式 ----------
+    function getInfoDivStyle() {
+        const dark = isDarkMode();
+        return `
+            position: fixed; top: 10px; right: 10px; z-index: 9999;
+            background: ${dark ? '#2d2d2d' : '#fff'}; color: ${dark ? '#e0e0e0' : '#000'};
+            padding: 12px 20px;
+            border-radius: 4px; font-family: '微软雅黑', sans-serif; font-size: 14px;
+            max-height: 500px; overflow: hidden;
+            width: 420px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+            border: 1px solid ${dark ? '#555' : '#999'};
+            display: flex; flex-direction: column;
+        `;
+    }
+
+    // 获取 XSRF Token（CSRF 防护）
+    function getXsrfToken() {
+        const match = document.cookie.match(/xsrf=([^;]+)/);
+        return match ? match[1] : '';
+    }
+
+    // ---------- 拉黑单个用户（带 CSRF Token 和备用 API） ----------
+    async function blockUser(userToken) {
+        const xsrfToken = getXsrfToken();
+        const headers = {
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'XMLHttpRequest',
+            'x-xsrftoken': xsrfToken
+        };
+
+        // 尝试主接口：/actions/block
+        const primaryUrl = `https://www.zhihu.com/api/v4/members/${userToken}/actions/block`;
+        const primaryResponse = await fetch(primaryUrl, {
+            method: 'POST',
+            credentials: 'include',
+            headers: headers
+        });
+
+        if (primaryResponse.ok) {
+            return primaryResponse;
+        }
+
+        // 主接口失败，尝试备用接口：/block
+        const fallbackUrl = `https://www.zhihu.com/api/v4/members/${userToken}/block`;
+        const fallbackResponse = await fetch(fallbackUrl, {
+            method: 'POST',
+            credentials: 'include',
+            headers: headers
+        });
+
+        return fallbackResponse;
+    }
+
     // ---------- 工具函数 ----------
     const fetchWithCreds = (url, options = {}) => {
         return fetch(url, {
@@ -82,7 +143,7 @@
             console.warn('Failed to get user info via API:', e);
         }
 
-        const manualInput = prompt('Cannot auto detect user ID, please enter your Zhihu ID manually:');
+        const manualInput = prompt('无法自动检测用户ID，请手动输入你的知乎用户ID（url_token）：');
         if (manualInput) {
             console.log(`Manual input: ${manualInput}`);
             return manualInput;
@@ -130,16 +191,7 @@
 
         // UI 进度框
         const infoDiv = document.createElement('div');
-        infoDiv.style.cssText = `
-            position: fixed; top: 10px; right: 10px; z-index: 9999;
-            background: #fff; color: #000; padding: 12px 20px;
-            border-radius: 4px; font-family: '微软雅黑', sans-serif; font-size: 14px;
-            max-height: 500px; overflow: hidden;
-            width: 420px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-            border: 1px solid #999;
-            display: flex; flex-direction: column;
-        `;
+        infoDiv.style.cssText = getInfoDivStyle();
         document.body.appendChild(infoDiv);
 
         const logArea = document.createElement('div');
@@ -157,7 +209,7 @@
         let shouldStop = false;
         stopBtn.addEventListener('click', () => {
             shouldStop = true;
-            console.log('User requested stop.');
+            console.log('用户请求停止');
         });
 
         function appendLog(html) {
@@ -169,12 +221,11 @@
             return `<a href="https://www.zhihu.com/people/${userToken}" target="_blank">${userToken}</a>`;
         }
 
-        appendLog('Getting your followees and followers (whitelist)...');
-        appendLog(`Whitelist: ${safeUserIds.size} people (followees + followers)`);
+        appendLog('正在获取你的关注和粉丝列表（白名单）...');
+        appendLog(`白名单人数：${safeUserIds.size} 人（关注 + 粉丝）`);
         appendLog('─────────────────────────────');
 
         const blockedUsers = [];
-        const sleep = timeout => new Promise(done => setTimeout(done, timeout));
 
         let currentApiIndex = 0;
         let votersApi = apiCandidates[0];
@@ -192,10 +243,10 @@
                     if (currentApiIndex < apiCandidates.length - 1) {
                         currentApiIndex++;
                         votersApi = apiCandidates[currentApiIndex];
-                        appendLog(`Switched to fallback API: ${votersApi}`);
+                        appendLog(`已切换到备用 API：${votersApi}`);
                         continue;
                     } else {
-                        appendLog('All APIs returned empty data, terminating.');
+                        appendLog('所有 API 返回空数据，终止执行');
                         break;
                     }
                 }
@@ -204,7 +255,7 @@
 
                 for (const voterInfo of voterList) {
                     if (shouldStop) {
-                        appendLog('Stopped by user.');
+                        appendLog('用户已停止');
                         break;
                     }
 
@@ -216,39 +267,37 @@
 
                     // 只跳过白名单，不再进行小号判断
                     if (safeUserIds.has(userId)) {
-                        appendLog(`Skipped (whitelist): ${userName} (${tokenLink(userToken)}) [${handledUsers}/${estimatedUsers}]`);
+                        appendLog(`已跳过（白名单）：${userName} (${tokenLink(userToken)}) [${handledUsers}/${estimatedUsers}]`);
                         continue;
                     }
 
                     // 直接拉黑
-                    const actionUrl = `https://www.zhihu.com/api/v4/members/${userToken}/actions/block`;
-                    const actionResponse = await fetchWithCreds(actionUrl, { method: 'POST' });
+                    const actionResponse = await blockUser(userToken);
                     if (actionResponse.ok) {
                         blockedUsers.push({ userName, userToken, profileUrl });
                         // 记录已拉黑用户
                         saveBlockedUser(userToken, userName);
                         blockedTokens.add(userToken);
-                        const msg = `Blocked: ${userName} (${tokenLink(userToken)}) [${handledUsers}/${estimatedUsers}]`;
+                        const msg = `已屏蔽：${userName} (${tokenLink(userToken)}) [${handledUsers}/${estimatedUsers}]`;
                         appendLog(msg);
                         // ---- 控制台显示拉黑进度 ----
                         console.log(`[已拉黑] ${userName} - 主页：https://www.zhihu.com/people/${userToken}`);
                     } else {
                         const errText = await actionResponse.text().catch(() => '');
-                        appendLog(`Failed: ${userName} (${tokenLink(userToken)}) status ${actionResponse.status}`);
-                        console.warn(`Block failed ${userName}: ${actionResponse.status} - ${errText}`);
+                        appendLog(`失败：${userName} (${tokenLink(userToken)}) 状态 ${actionResponse.status}`);
+                        console.warn(`拉黑失败 ${userName}: ${actionResponse.status} - ${errText}`);
                     }
-                    await sleep(100);
                 }
 
                 if (shouldStop) break;
                 reachedLastPage = !!(listPayload.paging && listPayload.paging.is_end);
                 pageOffset += 10;
             } catch (err) {
-                console.error('Main loop error:', err);
+                console.error('主循环错误：', err);
                 if (err.message && err.message.includes('405') && currentApiIndex < apiCandidates.length - 1) {
                     currentApiIndex++;
                     votersApi = apiCandidates[currentApiIndex];
-                    appendLog(`Got 405, switched to fallback API: ${votersApi}`);
+                    appendLog(`遇到 405 错误，已切换到备用 API：${votersApi}`);
                     continue;
                 } else {
                     break;
@@ -257,12 +306,12 @@
         }
 
         if (shouldStop) {
-            appendLog('User stopped, not fully completed.');
+            appendLog('用户已停止，未完全完成。');
         }
-        appendLog(`Done! Total blocked: ${blockedUsers.length}`);
-        console.log(`====== Blocked users (${sourceLabel}) ======`);
+        appendLog(`执行完毕！共拉黑：${blockedUsers.length} 人`);
+        console.log(`====== 已拉黑用户 (${sourceLabel}) ======`);
         console.table(blockedUsers);
-        console.log('Total blocked:', blockedUsers.length);
+        console.log('总拉黑数：', blockedUsers.length);
     }
 
     // ---------- 拉黑点赞者（原 answer/article 页面入口） ----------
@@ -287,7 +336,7 @@
                 `https://www.zhihu.com/api/v4/articles/${contentId}/likers`
             ];
         } else {
-            alert('Current page is not a Zhihu answer or article.');
+            alert('当前页面不是知乎回答或文章，无法使用此功能。');
             return;
         }
 
@@ -463,8 +512,8 @@
                 const answerApi = `https://www.zhihu.com/api/v4/answers/${contentId}`;
                 const resp = await fetchWithCreds(answerApi);
                 const data = await safeJson(resp);
-                if (data && data.author && data.author.id) {
-                    authorId = data.author.id;
+                if (data && data.author && data.author.url_token) {
+                    authorId = data.author.url_token;
                 } else {
                     alert('无法获取回答作者信息。');
                     return;
@@ -480,8 +529,8 @@
                 const articleApi = `https://www.zhihu.com/api/v4/articles/${contentId}`;
                 const resp = await fetchWithCreds(articleApi);
                 const data = await safeJson(resp);
-                if (data && data.author && data.author.id) {
-                    authorId = data.author.id;
+                if (data && data.author && data.author.url_token) {
+                    authorId = data.author.url_token;
                 } else {
                     alert('无法获取文章作者信息。');
                     return;
@@ -504,16 +553,7 @@
 
         // UI 进度框
         const infoDiv = document.createElement('div');
-        infoDiv.style.cssText = `
-            position: fixed; top: 10px; right: 10px; z-index: 9999;
-            background: #fff; color: #000; padding: 12px 20px;
-            border-radius: 4px; font-family: '微软雅黑', sans-serif; font-size: 14px;
-            max-height: 500px; overflow: hidden;
-            width: 420px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-            border: 1px solid #999;
-            display: flex; flex-direction: column;
-        `;
+        infoDiv.style.cssText = getInfoDivStyle();
         document.body.appendChild(infoDiv);
 
         const logArea = document.createElement('div');
@@ -531,7 +571,7 @@
         let shouldStop = false;
         stopBtn.addEventListener('click', () => {
             shouldStop = true;
-            console.log('User requested stop.');
+            console.log('用户请求停止');
         });
 
         function appendLog(html) {
@@ -543,12 +583,11 @@
             return `<a href="https://www.zhihu.com/people/${userToken}" target="_blank">${userToken}</a>`;
         }
 
-        appendLog('Fetching author\'s followers (excluding your whitelist)...');
-        appendLog(`Whitelist: ${safeUserIds.size} people (your followees + followers)`);
+        appendLog('正在获取作者的粉丝列表（排除白名单）...');
+        appendLog(`白名单人数：${safeUserIds.size} 人（你的关注 + 粉丝）`);
         appendLog('─────────────────────────────');
 
         const blockedUsers = [];
-        const sleep = timeout => new Promise(done => setTimeout(done, timeout));
 
         let offset = 0;
         const limit = 20;
@@ -567,7 +606,7 @@
 
                 for (const fan of fans) {
                     if (shouldStop) {
-                        appendLog('Stopped by user.');
+                        appendLog('用户已停止');
                         break;
                     }
                     handled++;
@@ -577,12 +616,11 @@
                     const profileUrl = `https://www.zhihu.com${fan.url}`;
 
                     if (safeUserIds.has(userId)) {
-                        appendLog(`Skipped (whitelist): ${userName} (${tokenLink(userToken)}) [${handled}/${estimated}]`);
+                        appendLog(`已跳过（白名单）：${userName} (${tokenLink(userToken)}) [${handled}/${estimated}]`);
                         continue;
                     }
 
-                    const actionUrl = `https://www.zhihu.com/api/v4/members/${userToken}/actions/block`;
-                    const actionResponse = await fetchWithCreds(actionUrl, { method: 'POST' });
+                    const actionResponse = await blockUser(userToken);
                     if (actionResponse.ok) {
                         blockedUsers.push({ userName, userToken, profileUrl });
                         // 记录已拉黑用户
@@ -596,27 +634,25 @@
                         appendLog(`失败：${userName} (${tokenLink(userToken)}) 状态 ${actionResponse.status}`);
                         console.warn(`拉黑失败 ${userName}: ${actionResponse.status} - ${errText}`);
                     }
-
-                    await sleep(1000);
                 }
 
                 if (shouldStop) break;
                 isEnd = data.paging && data.paging.is_end;
                 offset += limit;
             } catch (e) {
-                console.error('Error fetching fans:', e);
-                appendLog('Error fetching fans: ' + e.message);
+                console.error('获取粉丝列表出错：', e);
+                appendLog('获取粉丝列表出错：' + e.message);
                 break;
             }
         }
 
         if (shouldStop) {
-            appendLog('User stopped, not fully completed.');
+            appendLog('用户已停止，未完全完成。');
         }
-        appendLog(`Done! Total blocked: ${blockedUsers.length}`);
-        console.log('====== Blocked author\'s followers ======');
+        appendLog(`执行完毕！共拉黑：${blockedUsers.length} 人`);
+        console.log('====== 拉黑作者粉丝完成 ======');
         console.table(blockedUsers);
-        console.log('Total blocked:', blockedUsers.length);
+        console.log('总拉黑数：', blockedUsers.length);
     }
 
     // ---------- 创建悬浮按钮和菜单 ----------
@@ -646,14 +682,16 @@
         floatBtn.textContent = '⚙';
         document.body.appendChild(floatBtn);
 
+        const isDark = isDarkMode();
         const menu = document.createElement('div');
         menu.style.cssText = `
             position: fixed;
             bottom: 140px;
             right: 20px;
             z-index: 99999;
-            background: #fff;
-            border: 1px solid #ccc;
+            background: ${isDark ? '#2d2d2d' : '#fff'};
+            color: ${isDark ? '#e0e0e0' : '#000'};
+            border: 1px solid ${isDark ? '#555' : '#ccc'};
             border-radius: 4px;
             box-shadow: 0 2px 10px rgba(0,0,0,0.2);
             padding: 8px 0;
@@ -664,8 +702,8 @@
         `;
         const item1 = document.createElement('div');
         item1.textContent = '拉黑点赞者';
-        item1.style.cssText = 'padding: 8px 16px; cursor: pointer;';
-        item1.addEventListener('mouseenter', () => { item1.style.backgroundColor = '#f0f0f0'; });
+        item1.style.cssText = `padding: 8px 16px; cursor: pointer; color: ${isDark ? '#e0e0e0' : '#000'};`;
+        item1.addEventListener('mouseenter', () => { item1.style.backgroundColor = isDark ? '#3d3d3d' : '#f0f0f0'; });
         item1.addEventListener('mouseleave', () => { item1.style.backgroundColor = 'transparent'; });
         item1.addEventListener('click', () => {
             menu.style.display = 'none';
@@ -674,8 +712,8 @@
 
         const item2 = document.createElement('div');
         item2.textContent = '拉黑答主粉丝';
-        item2.style.cssText = 'padding: 8px 16px; cursor: pointer;';
-        item2.addEventListener('mouseenter', () => { item2.style.backgroundColor = '#f0f0f0'; });
+        item2.style.cssText = `padding: 8px 16px; cursor: pointer; color: ${isDark ? '#e0e0e0' : '#000'};`;
+        item2.addEventListener('mouseenter', () => { item2.style.backgroundColor = isDark ? '#3d3d3d' : '#f0f0f0'; });
         item2.addEventListener('mouseleave', () => { item2.style.backgroundColor = 'transparent'; });
         item2.addEventListener('click', () => {
             menu.style.display = 'none';
