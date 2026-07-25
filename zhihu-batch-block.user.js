@@ -165,7 +165,7 @@
                 const data = await safeJson(response);
                 if (!data) break;
                 const users = data.data || [];
-                users.forEach(user => allIds.add(user.id));
+                users.forEach(user => allIds.add(String(user.id)));
                 isEnd = data.paging && data.paging.is_end;
                 offset += limit;
             } catch (e) {
@@ -266,7 +266,7 @@
                     const profileUrl = `https://www.zhihu.com${voterInfo.url}`;
 
                     // 只跳过白名单，不再进行小号判断
-                    if (safeUserIds.has(userId)) {
+                    if (safeUserIds.has(String(userId))) {
                         appendLog(`已跳过（白名单）：${userName} (${tokenLink(userToken)}) [${handledUsers}/${estimatedUsers}]`);
                         continue;
                     }
@@ -615,7 +615,7 @@
                     const userToken = fan.url_token;
                     const profileUrl = `https://www.zhihu.com${fan.url}`;
 
-                    if (safeUserIds.has(userId)) {
+                    if (safeUserIds.has(String(userId))) {
                         appendLog(`已跳过（白名单）：${userName} (${tokenLink(userToken)}) [${handled}/${estimated}]`);
                         continue;
                     }
