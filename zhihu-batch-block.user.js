@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Block Zhihu User
 // @namespace    http://tampermonkey.net/
-// @version      2026-07-16
-// @description  知乎批量拉黑工具（点赞者 / 答主粉丝）
+// @version      2026-07-25
+// @description  知乎批量拉黑工具（点赞者 / 答主粉丝）— 支持回答页一键拉黑点赞者 + 已拉黑标记
 // @author       maxkk26
 // @match        https://*/*
 // @icon         data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==
@@ -11,6 +11,28 @@
 
 (function() {
     'use strict';
+
+    // ====== 已拉黑用户追踪（localStorage 持久化 + 快速 Set） ======
+    const BLOCKED_KEY = 'zhihu_blocked_users';
+
+    function loadBlockedUsers() {
+        try {
+            return JSON.parse(localStorage.getItem(BLOCKED_KEY) || '[]');
+        } catch (e) {
+            return [];
+        }
+    }
+
+    function saveBlockedUser(userToken, userName) {
+        const list = loadBlockedUsers();
+        if (!list.some(u => u.token === userToken)) {
+            list.push({ token: userToken, name: userName, time: Date.now() });
+            localStorage.setItem(BLOCKED_KEY, JSON.stringify(list));
+        }
+    }
+
+    // 当前会话中的已拉黑 token 集合（快速查找，避免频繁读 localStorage）
+    const blockedTokens = new Set(loadBlockedUsers().map(u => u.token));
 
     // ---------- 工具函数 ----------
     const fetchWithCreds = (url, options = {}) => {
@@ -93,35 +115,11 @@
         return allIds;
     }
 
-    // ---------- 拉黑点赞者（已删除小号判断） ----------
-    async function blockUpvoters() {
+    // ---------- 核心拉黑流程（抽取公用，供不同入口调用） ----------
+    async function executeBlockFlow({ apiCandidates, sourceLabel }) {
         const MY_USER_ID = await getCurrentUserId();
         if (!MY_USER_ID) {
             console.error('Cannot get user ID, abort.');
-            return;
-        }
-
-        const pageHref = location.href;
-        let apiCandidates = [];
-        let contentType = '';
-        let contentId = '';
-
-        const answerMatch = pageHref.match(/^https:\/\/www\.zhihu\.com\/question\/(\d+)\/answer\/(\d+)/);
-        const articleMatch = pageHref.match(/^https:\/\/zhuanlan\.zhihu\.com\/p\/(\d+)/);
-
-        if (answerMatch) {
-            contentType = 'answer';
-            contentId = answerMatch[2];
-            apiCandidates = [`https://www.zhihu.com/api/v4/answers/${contentId}/upvoters`];
-        } else if (articleMatch) {
-            contentType = 'article';
-            contentId = articleMatch[1];
-            apiCandidates = [
-                `https://www.zhihu.com/api/v4/articles/${contentId}/voters`,
-                `https://www.zhihu.com/api/v4/articles/${contentId}/likers`
-            ];
-        } else {
-            alert('Current page is not a Zhihu answer or article.');
             return;
         }
 
@@ -227,7 +225,13 @@
                     const actionResponse = await fetchWithCreds(actionUrl, { method: 'POST' });
                     if (actionResponse.ok) {
                         blockedUsers.push({ userName, userToken, profileUrl });
-                        appendLog(`Blocked: ${userName} (${tokenLink(userToken)}) [${handledUsers}/${estimatedUsers}]`);
+                        // 记录已拉黑用户
+                        saveBlockedUser(userToken, userName);
+                        blockedTokens.add(userToken);
+                        const msg = `Blocked: ${userName} (${tokenLink(userToken)}) [${handledUsers}/${estimatedUsers}]`;
+                        appendLog(msg);
+                        // ---- 控制台显示拉黑进度 ----
+                        console.log(`[已拉黑] ${userName} - 主页：https://www.zhihu.com/people/${userToken}`);
                     } else {
                         const errText = await actionResponse.text().catch(() => '');
                         appendLog(`Failed: ${userName} (${tokenLink(userToken)}) status ${actionResponse.status}`);
@@ -256,9 +260,174 @@
             appendLog('User stopped, not fully completed.');
         }
         appendLog(`Done! Total blocked: ${blockedUsers.length}`);
-        console.log(`====== Blocked users (${contentType}) ======`);
+        console.log(`====== Blocked users (${sourceLabel}) ======`);
         console.table(blockedUsers);
         console.log('Total blocked:', blockedUsers.length);
+    }
+
+    // ---------- 拉黑点赞者（原 answer/article 页面入口） ----------
+    async function blockUpvoters() {
+        const pageHref = location.href;
+        let apiCandidates = [];
+        let contentType = '';
+        let contentId = '';
+
+        const answerMatch = pageHref.match(/^https:\/\/www\.zhihu\.com\/question\/(\d+)\/answer\/(\d+)/);
+        const articleMatch = pageHref.match(/^https:\/\/zhuanlan\.zhihu\.com\/p\/(\d+)/);
+
+        if (answerMatch) {
+            contentType = 'answer';
+            contentId = answerMatch[2];
+            apiCandidates = [`https://www.zhihu.com/api/v4/answers/${contentId}/upvoters`];
+        } else if (articleMatch) {
+            contentType = 'article';
+            contentId = articleMatch[1];
+            apiCandidates = [
+                `https://www.zhihu.com/api/v4/articles/${contentId}/voters`,
+                `https://www.zhihu.com/api/v4/articles/${contentId}/likers`
+            ];
+        } else {
+            alert('Current page is not a Zhihu answer or article.');
+            return;
+        }
+
+        await executeBlockFlow({
+            apiCandidates,
+            sourceLabel: `${contentType} upvoters`
+        });
+    }
+
+    // ---------- 拉黑指定回答的点赞者（问题页面按钮使用） ----------
+    async function blockAnswerUpvoters(answerId) {
+        await executeBlockFlow({
+            apiCandidates: [`https://www.zhihu.com/api/v4/answers/${answerId}/upvoters`],
+            sourceLabel: `answer #${answerId} upvoters`
+        });
+    }
+
+    // ---------- 在每个回答操作栏「分享」右侧添加「🚫拉黑」按钮 ----------
+    function addBlockButtonsToActionBar() {
+        if (!/^https:\/\/www\.zhihu\.com\/question\/\d+$/.test(location.href)) return;
+
+        document.querySelectorAll('.AnswerItem, [data-za-module="AnswerItem"]').forEach(card => {
+            if (card.querySelector('.zhihu-block-action-btn')) return;
+
+            const answerId = extractAnswerId(card);
+            if (!answerId) return;
+
+            const actionsBar = card.querySelector('.ContentItem-actions');
+            if (!actionsBar) return;
+
+            // 找到「分享」按钮（文本包含「分享」的元素）
+            const allActions = [...actionsBar.querySelectorAll('button, a, [role="button"], .ContentItem-action')];
+            const shareBtn = allActions.find(el => el.textContent.includes('分享'));
+            if (!shareBtn) return;
+
+            const btn = document.createElement('button');
+            btn.className = 'zhihu-block-action-btn';
+            btn.innerHTML = '🚫拉黑';
+            btn.style.cssText = `
+                margin-left: 8px;
+                padding: 0 10px;
+                height: 28px;
+                background: #999;
+                color: #fff;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 13px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+                line-height: 28px;
+                white-space: nowrap;
+                vertical-align: middle;
+                opacity: 0.85;
+                transition: background 0.15s, opacity 0.15s;
+            `;
+            btn.addEventListener('mouseenter', () => { btn.style.background = '#777'; btn.style.opacity = '1'; });
+            btn.addEventListener('mouseleave', () => { btn.style.background = '#999'; btn.style.opacity = '0.85'; });
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (btn.disabled) return;
+                btn.innerHTML = '⏳执行中...';
+                btn.disabled = true;
+                btn.style.background = '#bbb';
+                blockAnswerUpvoters(answerId).finally(() => {
+                    btn.innerHTML = '🚫拉黑';
+                    btn.disabled = false;
+                    btn.style.background = '#999';
+                });
+            });
+
+            shareBtn.insertAdjacentElement('afterend', btn);
+        });
+    }
+
+    // 从回答元素中提取回答ID
+    function extractAnswerId(card) {
+        // 尝试 data-zop 属性（Zhihu 常用，包含 JSON）
+        const zop = card.getAttribute('data-zop');
+        if (zop) {
+            try {
+                const parsed = JSON.parse(zop);
+                if (parsed.answerId) return String(parsed.answerId);
+            } catch (e) {}
+        }
+
+        // 尝试 data-za-detail 属性
+        const zaDetail = card.getAttribute('data-za-detail');
+        if (zaDetail) {
+            try {
+                const parsed = JSON.parse(zaDetail);
+                if (parsed.answer_id) return String(parsed.answer_id);
+            } catch (e) {}
+        }
+
+        // 尝试查找包含 answer ID 的链接
+        const link = card.querySelector('a[href*="/answer/"]');
+        if (link) {
+            const match = link.href.match(/\/answer\/(\d+)/);
+            if (match) return match[1];
+        }
+
+        // 尝试 data-answer-id 属性
+        const dataId = card.getAttribute('data-answer-id');
+        if (dataId) return String(dataId);
+
+        // 尝试查找带 data-aid 属性的子元素
+        const aidEl = card.querySelector('[data-aid]');
+        if (aidEl) return aidEl.getAttribute('data-aid');
+
+        return null;
+    }
+
+    // ---------- 在已拉黑用户的用户名后追加「（已拉黑）」 ----------
+    function setupBlockedLabel() {
+        const observer = new MutationObserver(() => {
+            const selector = [
+                '.UserLink-link:not(.zhihu-labeled)',                   // 用户名链接
+                '.CommentItem a[href*="/people/"]:not(.zhihu-labeled)'  // 评论区用户名
+            ].join(', ');
+
+            document.querySelectorAll(selector).forEach(link => {
+                const match = link.href && link.href.match(/\/people\/([^/?&]+)/);
+                if (!match) return;
+                const token = match[1];
+
+                link.classList.add('zhihu-labeled');
+
+                // 过滤数字文本（如点赞数 "123"）或空文本
+                const text = link.textContent.trim();
+                if (/^\d+$/.test(text) || text.length === 0) return;
+                if (text.includes('（已拉黑）')) return;
+
+                if (blockedTokens.has(token)) {
+                    // 直接在用户名后追加文字，不创建额外元素
+                    link.append('（已拉黑）');
+                }
+            });
+        });
+
+        observer.observe(document.body, { childList: true, subtree: true });
     }
 
     // ---------- 拉黑答主的粉丝（无小号判断，三次确认） ----------
@@ -412,19 +581,24 @@
                         continue;
                     }
 
-                const actionUrl = `https://www.zhihu.com/api/v4/members/${userToken}/actions/block`;
-                const actionResponse = await fetchWithCreds(actionUrl, { method: 'POST' });
-                if (actionResponse.ok) {
-                    blockedUsers.push({ userName, userToken, profileUrl });
-                    appendLog(`已屏蔽：${userName} (${tokenLink(userToken)}) [${handledUsers}/${estimatedUsers}]`);
-                } else {
-                    const errText = await actionResponse.text().catch(() => '');
-                    appendLog(`失败：${userName} (${tokenLink(userToken)}) 状态 ${actionResponse.status}`);
-                    console.warn(`拉黑失败 ${userName}: ${actionResponse.status} - ${errText}`);
-                }
+                    const actionUrl = `https://www.zhihu.com/api/v4/members/${userToken}/actions/block`;
+                    const actionResponse = await fetchWithCreds(actionUrl, { method: 'POST' });
+                    if (actionResponse.ok) {
+                        blockedUsers.push({ userName, userToken, profileUrl });
+                        // 记录已拉黑用户
+                        saveBlockedUser(userToken, userName);
+                        blockedTokens.add(userToken);
+                        appendLog(`已屏蔽：${userName} (${tokenLink(userToken)}) [${handled}/${estimated}]`);
+                        // ---- 控制台显示拉黑进度 ----
+                        console.log(`[已拉黑] ${userName} - 主页：https://www.zhihu.com/people/${userToken}`);
+                    } else {
+                        const errText = await actionResponse.text().catch(() => '');
+                        appendLog(`失败：${userName} (${tokenLink(userToken)}) 状态 ${actionResponse.status}`);
+                        console.warn(`拉黑失败 ${userName}: ${actionResponse.status} - ${errText}`);
+                    }
 
-                await sleep(1000);
-            }
+                    await sleep(1000);
+                }
 
                 if (shouldStop) break;
                 isEnd = data.paging && data.paging.is_end;
@@ -525,9 +699,27 @@
         });
     }
 
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', createUI);
-    } else {
+    // ---------- 页面加载后的主初始化 ----------
+    function init() {
         createUI();
+
+        // 在已拉黑用户的用户名后追加「（已拉黑）」
+        setupBlockedLabel();
+
+        // 如果是问题页面，在操作栏添加「🚫拉黑」按钮
+        if (/^https:\/\/www\.zhihu\.com\/question\/\d+$/.test(location.href)) {
+            addBlockButtonsToActionBar();
+            // 监听动态加载的回答（无限滚动）
+            const pageObserver = new MutationObserver(() => {
+                addBlockButtonsToActionBar();
+            });
+            pageObserver.observe(document.body, { childList: true, subtree: true });
+        }
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
     }
 })();
