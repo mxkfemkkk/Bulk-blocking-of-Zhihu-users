@@ -34,6 +34,64 @@
     // 当前会话中的已拉黑 token 集合（快速查找，避免频繁读 localStorage）
     const blockedTokens = new Set(loadBlockedUsers().map(u => u.token));
 
+    // 从本地拉黑列表中移除指定用户
+    function removeBlockedUser(userToken) {
+        blockedTokens.delete(userToken);
+        const list = loadBlockedUsers().filter(u => u.token !== userToken);
+        localStorage.setItem(BLOCKED_KEY, JSON.stringify(list));
+    }
+
+    // 已验证的拉黑状态缓存（避免重复请求）
+    const verifiedBlockCache = new Map();
+
+    // 验证用户是否真的被知乎拉黑（异步，会从知乎 API 同步真实状态）
+    async function verifyBlockedStatus(userToken) {
+        if (verifiedBlockCache.has(userToken)) {
+            return verifiedBlockCache.get(userToken);
+        }
+
+        // 如果在个人主页，尝试从页面 __INITIAL_STATE__ 获取
+        const profileMatch = location.href.match(/https:\/\/www\.zhihu\.com\/people\/([^/?&]+)/);
+        if (profileMatch && profileMatch[1] === userToken) {
+            try {
+                const state = window.__INITIAL_STATE__;
+                if (state) {
+                    const isBlocked = state?.people?.profile?.isBlocked ??
+                                      state?.people?.isBlocked ??
+                                      state?.profile?.isBlocked;
+                    if (typeof isBlocked === 'boolean') {
+                        verifiedBlockCache.set(userToken, isBlocked);
+                        return isBlocked;
+                    }
+                }
+            } catch (e) {}
+        }
+
+        // 通过知乎 API 获取用户关系状态
+        try {
+            const resp = await fetch(
+                `https://www.zhihu.com/api/v4/members/${userToken}?include=is_blocked`,
+                {
+                    credentials: 'include',
+                    headers: {
+                        'Accept': 'application/json',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    }
+                }
+            );
+            if (resp.ok) {
+                const data = await resp.json().catch(() => ({}));
+                const isBlocked = data.is_blocked === true || data.blocking === true;
+                verifiedBlockCache.set(userToken, isBlocked);
+                return isBlocked;
+            }
+        } catch (e) {}
+
+        // 无法确定，回退到本地缓存
+        verifiedBlockCache.set(userToken, blockedTokens.has(userToken));
+        return blockedTokens.has(userToken);
+    }
+
     // ---------- 检测知乎深色模式 ----------
     function isDarkMode() {
         return document.documentElement.getAttribute('data-theme') === 'dark' ||
@@ -65,7 +123,15 @@
 
     // ---------- 拉黑单个用户（带 CSRF Token 和备用 API） ----------
     async function blockUser(userToken) {
-        const xsrfToken = getXsrfToken();
+        let xsrfToken = getXsrfToken();
+        if (!xsrfToken) {
+            // 部分版本知乎使用 _xsrf cookie，再试一次
+            const match = document.cookie.match(/[;]?\s*_xsrf=([^;]+)/);
+            xsrfToken = match ? match[1] : '';
+            if (!xsrfToken) {
+                console.warn('未找到 xsrf/_xsrf cookie，CSRF token 为空，拉黑请求可能被拒绝');
+            }
+        }
         const headers = {
             'Content-Type': 'application/json',
             'X-Requested-With': 'XMLHttpRequest',
@@ -294,10 +360,12 @@
                 pageOffset += 10;
             } catch (err) {
                 console.error('主循环错误：', err);
-                if (err.message && err.message.includes('405') && currentApiIndex < apiCandidates.length - 1) {
+                const is404or405 = err.message && (err.message.includes('404') || err.message.includes('405'));
+                if (is404or405 && currentApiIndex < apiCandidates.length - 1) {
                     currentApiIndex++;
                     votersApi = apiCandidates[currentApiIndex];
-                    appendLog(`遇到 405 错误，已切换到备用 API：${votersApi}`);
+                    const code = err.message.includes('404') ? '404' : '405';
+                    appendLog(`遇到 ${code} 错误，已切换到备用 API：${votersApi}`);
                     continue;
                 } else {
                     break;
@@ -470,8 +538,19 @@
                 if (text.includes('（已拉黑）')) return;
 
                 if (blockedTokens.has(token)) {
-                    // 直接在用户名后追加文字，不创建额外元素
+                    // 先在用户名后追加文字（即时响应本地缓存）
                     link.append('（已拉黑）');
+
+                    // 异步验证真实拉黑状态，如果已取消则清理
+                    verifyBlockedStatus(token).then(isBlocked => {
+                        if (!isBlocked) {
+                            removeBlockedUser(token);
+                            const textNode = [...link.childNodes].find(n =>
+                                n.nodeType === Node.TEXT_NODE && n.textContent.includes('（已拉黑）')
+                            );
+                            if (textNode) textNode.remove();
+                        }
+                    });
                 }
             });
         });
