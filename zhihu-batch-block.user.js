@@ -816,6 +816,201 @@
         });
     }
 
+    // ====== 个人主页「拉黑」按钮 ======
+
+    // 检测当前页面是否是知乎个人主页（非本人）
+    function isProfilePage() {
+        const match = location.pathname.match(/^\/people\/([^/?&]+)/);
+        return match ? match[1] : null;
+    }
+
+    // 获取红按钮的标准样式
+    function getBlockButtonStyle(isHover) {
+        const bgColor = isHover ? '#C0392B' : '#E03A3A';
+        const borderColor = isHover ? '#A93226' : '#E03A3A';
+        return `
+            max-width: 100.797px;
+            height: 34px;
+            min-width: 96px;
+            padding: 0 16px;
+            border: 1px solid ${borderColor};
+            border-radius: 3px;
+            background: ${bgColor};
+            color: rgb(255, 255, 255);
+            font-size: 14px;
+            line-height: 32px;
+            font-weight: 400;
+            font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+            box-sizing: border-box;
+            display: inline-block;
+            text-align: center;
+            cursor: pointer;
+            transition: background 0.2s, border-color 0.2s;
+            vertical-align: middle;
+            user-select: none;
+            outline: none;
+            margin: 0;
+            margin-right: 8px;
+        `;
+    }
+
+    // 在非本人的个人主页添加红色「拉黑」按钮
+    function addProfilePageBlockButton() {
+        // 仅当在 /people/{token} 路径时执行
+        const targetToken = isProfilePage();
+        if (!targetToken) return;
+
+        // 如果已经有我们添加的按钮，不再重复添加
+        if (document.querySelector('.zhihu-profile-block-btn')) return;
+
+        // 查找关注按钮所在的容器
+        const followSelectors = [
+            '.ProfileHeader-actions button',           // 经典个人主页
+            '.ProfileHeader-contentFooter button',     // 新版个人主页
+            '.SelfProfileHeader-actions button',       // 旧版
+            '.ProfileMain-header button',              // 另一种布局
+            'button.FollowButton',                     // 通用 FollowButton
+            '[class*="ProfileHeader"] button',          // 模糊匹配
+            '[class*="profileHeader"] button'
+        ];
+
+        // 找到包含「关注」文本的按钮
+        let followBtn = null;
+        for (const sel of followSelectors) {
+            const btns = document.querySelectorAll(sel);
+            for (const btn of btns) {
+                const text = btn.textContent.trim();
+                if (text.includes('关注') && !text.includes('已关注') && !text.includes('拉黑')) {
+                    followBtn = btn;
+                    break;
+                }
+            }
+            if (followBtn) break;
+        }
+
+        if (!followBtn) return;
+
+        // 确定按钮容器（父元素）
+        const container = followBtn.parentElement;
+        if (!container) return;
+
+        // 检查是否已有我们的按钮
+        if (container.querySelector('.zhihu-profile-block-btn')) return;
+
+        // 创建拉黑按钮
+        const blockBtn = document.createElement('button');
+        blockBtn.className = 'zhihu-profile-block-btn';
+        const isAlreadyBlocked = blockedTokens.has(targetToken);
+        blockBtn.textContent = isAlreadyBlocked ? '已拉黑' : '拉黑 Ta';
+        if (isAlreadyBlocked) {
+            blockBtn.dataset.blocked = 'true';
+            blockBtn.style.cssText = getBlockButtonStyle(false)
+                .replace('#E03A3A', '#999')
+                .replace('#C0392B', '#888');
+            blockBtn.style.background = '#999';
+            blockBtn.style.borderColor = '#888';
+            blockBtn.style.cursor = 'not-allowed';
+            blockBtn.style.opacity = '0.7';
+        } else {
+            blockBtn.style.cssText = getBlockButtonStyle(false);
+        }
+
+        // hover 效果
+        blockBtn.addEventListener('mouseenter', () => {
+            blockBtn.style.cssText = getBlockButtonStyle(true);
+        });
+        blockBtn.addEventListener('mouseleave', () => {
+            if (blockBtn.dataset.blocked === 'true') {
+                blockBtn.style.cssText = getBlockButtonStyle(false)
+                    .replace('#E03A3A', '#999')
+                    .replace('#C0392B', '#888');
+                blockBtn.style.background = '#999';
+                blockBtn.style.borderColor = '#888';
+            } else {
+                blockBtn.style.cssText = getBlockButtonStyle(false);
+            }
+        });
+
+        // 点击事件
+        blockBtn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+
+            if (blockBtn.dataset.blocked === 'true') return;
+            if (blockBtn.dataset.loading === 'true') return;
+
+            // 二次确认
+            if (!confirm('确定要拉黑该用户吗？拉黑后将无法看到对方的内容，且此操作不可逆。')) {
+                return;
+            }
+
+            blockBtn.dataset.loading = 'true';
+            blockBtn.textContent = '处理中...';
+            blockBtn.style.background = '#b03a2e';
+            blockBtn.style.borderColor = '#b03a2e';
+            blockBtn.style.cursor = 'not-allowed';
+
+            try {
+                // 检查是否登录
+                const myUserId = await getCurrentUserId();
+                if (!myUserId) {
+                    alert('获取用户信息失败，请确认已登录知乎。');
+                    blockBtn.dataset.loading = 'false';
+                    blockBtn.textContent = '拉黑 Ta';
+                    blockBtn.style.cssText = getBlockButtonStyle(false);
+                    return;
+                }
+
+                // 如果是自己的主页，不操作
+                if (targetToken === myUserId) {
+                    alert('不能拉黑自己。');
+                    blockBtn.dataset.loading = 'false';
+                    blockBtn.textContent = '拉黑 Ta';
+                    blockBtn.style.cssText = getBlockButtonStyle(false);
+                    return;
+                }
+
+                // 调用拉黑 API
+                const response = await blockUser(targetToken);
+
+                if (response.ok) {
+                    // 成功：记录到缓存
+                    const userName = document.querySelector('[class*="ProfileHeader"] h1, [class*="profileHeader"] h1, .ProfileHeader-name, .title')?.textContent?.trim() || targetToken;
+                    saveBlockedUser(targetToken, userName);
+                    blockedTokens.add(targetToken);
+
+                    // 更新按钮状态为「已拉黑」
+                    blockBtn.dataset.blocked = 'true';
+                    blockBtn.dataset.loading = 'false';
+                    blockBtn.textContent = '已拉黑';
+                    blockBtn.style.cssText = getBlockButtonStyle(false)
+                        .replace('#E03A3A', '#999')
+                        .replace('#C0392B', '#888');
+                    blockBtn.style.background = '#999';
+                    blockBtn.style.borderColor = '#888';
+                    blockBtn.style.cursor = 'not-allowed';
+                    blockBtn.style.opacity = '0.7';
+                } else {
+                    const errText = await response.text().catch(() => '');
+                    console.error('拉黑失败:', response.status, errText);
+                    alert(`拉黑失败（HTTP ${response.status}），请稍后重试。`);
+                    blockBtn.dataset.loading = 'false';
+                    blockBtn.textContent = '拉黑 Ta';
+                    blockBtn.style.cssText = getBlockButtonStyle(false);
+                }
+            } catch (err) {
+                console.error('拉黑过程中出错:', err);
+                alert('拉黑过程中发生错误，请查看控制台了解详情。');
+                blockBtn.dataset.loading = 'false';
+                blockBtn.textContent = '拉黑 Ta';
+                blockBtn.style.cssText = getBlockButtonStyle(false);
+            }
+        });
+
+        // 插入到关注按钮之前
+        container.insertBefore(blockBtn, followBtn);
+    }
+
     // ---------- 页面加载后的主初始化 ----------
     function init() {
         createUI();
@@ -831,6 +1026,18 @@
                 addBlockButtonsToActionBar();
             });
             pageObserver.observe(document.body, { childList: true, subtree: true });
+        }
+
+        // 如果是个人主页，添加「拉黑 Ta」按钮
+        if (isProfilePage()) {
+            // 初始尝试
+            addProfilePageBlockButton();
+
+            // 监听 DOM 变化，等待关注按钮加载完成
+            const profileObserver = new MutationObserver(() => {
+                addProfilePageBlockButton();
+            });
+            profileObserver.observe(document.body, { childList: true, subtree: true });
         }
     }
 
