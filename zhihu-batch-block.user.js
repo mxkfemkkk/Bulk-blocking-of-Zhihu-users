@@ -93,10 +93,38 @@
     }
 
     // ---------- 检测知乎深色模式 ----------
-    function isDarkMode() {
+    function getThemeMode() {
+        const urlTheme = new URLSearchParams(location.search).get('theme');
+        if (urlTheme === 'dark' || urlTheme === 'light') {
+            return urlTheme;
+        }
+
+        const cookieMatch = document.cookie.match(/(?:^|;\s*)zhihu_theme=([^;]+)/);
+        if (cookieMatch) {
+            const cookieTheme = decodeURIComponent(cookieMatch[1]).toLowerCase();
+            if (cookieTheme === 'dark' || cookieTheme === 'light') {
+                return cookieTheme;
+            }
+        }
+
         return document.documentElement.getAttribute('data-theme') === 'dark' ||
                document.documentElement.classList.contains('dark') ||
-               window.matchMedia('(prefers-color-scheme: dark)').matches;
+               window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+
+    function isDarkMode() {
+        return getThemeMode() === 'dark';
+    }
+
+    function setThemeMode(mode) {
+        const normalizedMode = mode === 'dark' ? 'dark' : 'light';
+        const expires = '; max-age=31536000; path=/';
+        const domain = location.hostname.endsWith('zhihu.com') ? '; domain=.zhihu.com' : '';
+        document.cookie = `zhihu_theme=${normalizedMode}${expires}${domain}`;
+
+        const url = new URL(location.href);
+        url.searchParams.set('theme', normalizedMode);
+        window.location.href = url.toString();
     }
 
     // ---------- 获取深色模式下的信息框样式 ----------
@@ -799,8 +827,21 @@
             blockAuthorFollowers();
         });
 
+        const item3 = document.createElement('div');
+        const initialThemeMode = getThemeMode();
+        item3.textContent = initialThemeMode === 'dark' ? '浅色模式' : '深色模式';
+        item3.style.cssText = `padding: 8px 16px; cursor: pointer; color: ${isDark ? '#e0e0e0' : '#000'};`;
+        item3.addEventListener('mouseenter', () => { item3.style.backgroundColor = isDark ? '#3d3d3d' : '#f0f0f0'; });
+        item3.addEventListener('mouseleave', () => { item3.style.backgroundColor = 'transparent'; });
+        item3.addEventListener('click', () => {
+            menu.style.display = 'none';
+            const nextMode = getThemeMode() === 'dark' ? 'light' : 'dark';
+            setThemeMode(nextMode);
+        });
+
         menu.appendChild(item1);
         menu.appendChild(item2);
+        menu.appendChild(item3);
         document.body.appendChild(menu);
 
         floatBtn.addEventListener('click', (e) => {
