@@ -2,7 +2,7 @@
 // @name         Block Zhihu User
 // @namespace    http://tampermonkey.net/
 // @version      2026-07-25
-// @description  知乎批量拉黑工具（点赞者 / 答主粉丝）— 支持回答页一键拉黑点赞者 + 已拉黑标记
+// @description  Better Zhihu
 // @author       maxkk26
 // @match        https://*/*
 // @icon         data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==
@@ -125,6 +125,61 @@
         const url = new URL(location.href);
         url.searchParams.set('theme', normalizedMode);
         window.location.href = url.toString();
+    }
+
+    // ====== 知乎直答链接处理 ======
+
+    function getZhidaMode() {
+        const cookieMatch = document.cookie.match(/(?:^|;\s*)zhihu_zhida_mode=([^;]+)/);
+        if (cookieMatch) {
+            const mode = decodeURIComponent(cookieMatch[1]);
+            if (mode === 'google' || mode === 'plain') return mode;
+        }
+        return 'disabled';
+    }
+
+    function setZhidaMode(mode) {
+        const expires = '; max-age=31536000; path=/';
+        const domain = location.hostname.endsWith('zhihu.com') ? '; domain=.zhihu.com' : '';
+        document.cookie = `zhihu_zhida_mode=${mode}${expires}${domain}`;
+    }
+
+    const zhidaModeLabels = { disabled: '禁用', google: 'Google搜索', plain: '纯文本' };
+    const zhidaModeCycle = ['disabled', 'google', 'plain'];
+
+    function applyZhidaMode(mode) {
+        if (mode === 'disabled') return;
+        const selector = 'a.RichContent-EntityWord[href*="zhida.zhihu.com"], a[href*="zhida.zhihu.com"]';
+        document.querySelectorAll(selector).forEach(el => {
+            if (el.dataset.zhidaProcessed) return;
+            el.dataset.zhidaProcessed = 'true';
+
+            if (mode === 'google') {
+                const query = el.textContent.trim();
+                el.href = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+                el.target = '_blank';
+                el.rel = 'noopener noreferrer';
+            } else if (mode === 'plain') {
+                const text = el.textContent;
+                const span = document.createElement('span');
+                span.textContent = text;
+                span.style.cssText = window.getComputedStyle(el).cssText;
+                el.parentNode.replaceChild(span, el);
+            }
+        });
+    }
+
+    // ====== 专栏优化状态持久化 ======
+
+    function getZhuanlanOptimized() {
+        const cookieMatch = document.cookie.match(/(?:^|;\s*)zhihu_zhuanlan_optimized=([^;]+)/);
+        return cookieMatch && decodeURIComponent(cookieMatch[1]) === 'true';
+    }
+
+    function setZhuanlanOptimizedCookie(value) {
+        const expires = '; max-age=31536000; path=/';
+        const domain = location.hostname.endsWith('zhihu.com') ? '; domain=.zhihu.com' : '';
+        document.cookie = `zhihu_zhuanlan_optimized=${value}${expires}${domain}`;
     }
 
     // ---------- 获取深色模式下的信息框样式 ----------
@@ -362,6 +417,12 @@
                     // 只跳过白名单，不再进行小号判断
                     if (safeUserIds.has(String(userId))) {
                         appendLog(`已跳过（白名单）：${userName} (${tokenLink(userToken)}) [${handledUsers}/${estimatedUsers}]`);
+                        continue;
+                    }
+
+                    // 已拉黑用户标记后跳过
+                    if (blockedTokens.has(userToken)) {
+                        appendLog(`${userName}（已屏蔽）(${tokenLink(userToken)}) [${handledUsers}/${estimatedUsers}]`);
                         continue;
                     }
 
@@ -727,6 +788,12 @@
                         continue;
                     }
 
+                    // 已拉黑用户标记后跳过
+                    if (blockedTokens.has(userToken)) {
+                        appendLog(`${userName}（已屏蔽）(${tokenLink(userToken)}) [${handled}/${estimated}]`);
+                        continue;
+                    }
+
                     const actionResponse = await blockUser(userToken);
                     if (actionResponse.ok) {
                         blockedUsers.push({ userName, userToken, profileUrl });
@@ -842,6 +909,42 @@
         menu.appendChild(item1);
         menu.appendChild(item2);
         menu.appendChild(item3);
+
+        // —— 知乎直答处理设置 ——
+        const currentZhidaMode = getZhidaMode();
+        const itemZhida = document.createElement('div');
+        itemZhida.textContent = `知乎直答: ${zhidaModeLabels[currentZhidaMode]}`;
+        itemZhida.style.cssText = `padding: 8px 16px; cursor: pointer; color: ${isDark ? '#e0e0e0' : '#000'};`;
+        itemZhida.addEventListener('mouseenter', () => { itemZhida.style.backgroundColor = isDark ? '#3d3d3d' : '#f0f0f0'; });
+        itemZhida.addEventListener('mouseleave', () => { itemZhida.style.backgroundColor = 'transparent'; });
+        itemZhida.addEventListener('click', () => {
+            menu.style.display = 'none';
+            const current = getZhidaMode();
+            const idx = zhidaModeCycle.indexOf(current);
+            const next = zhidaModeCycle[(idx + 1) % zhidaModeCycle.length];
+            setZhidaMode(next);
+            itemZhida.textContent = `知乎直答: ${zhidaModeLabels[next]}`;
+            // 如果当前页面有 zhida 链接，立即应用新设置
+            applyZhidaMode(next);
+        });
+        menu.appendChild(itemZhida);
+
+        // —— 专栏优化入口（仅 zhuanlan.zhihu.com） ——
+        if (location.hostname === 'zhuanlan.zhihu.com') {
+            const item4 = document.createElement('div');
+            const optimized = getZhuanlanOptimized();
+            item4.textContent = optimized ? '专栏优化 ✓' : '优化专栏阅读';
+            item4.style.cssText = `padding: 8px 16px; cursor: pointer; color: ${isDark ? '#e0e0e0' : '#000'}; border-top: 1px solid ${isDark ? '#555' : '#e0e0e0'}; margin-top: 4px; padding-top: 12px;`;
+            item4.addEventListener('mouseenter', () => { item4.style.backgroundColor = isDark ? '#3d3d3d' : '#f0f0f0'; });
+            item4.addEventListener('mouseleave', () => { item4.style.backgroundColor = 'transparent'; });
+            item4.addEventListener('click', () => {
+                menu.style.display = 'none';
+                toggleZhuanlanOptimize();
+                item4.textContent = zhuanlanSavedState ? '专栏优化 ✓' : '优化专栏阅读';
+            });
+            menu.appendChild(item4);
+        }
+
         document.body.appendChild(menu);
 
         floatBtn.addEventListener('click', (e) => {
@@ -1052,6 +1155,111 @@
         container.insertBefore(blockBtn, followBtn);
     }
 
+    // ====== 知乎专栏阅读优化 ======
+
+    let zhuanlanSavedState = null;
+
+    function toggleZhuanlanOptimize(skipSave) {
+        if (location.hostname !== 'zhuanlan.zhihu.com') return;
+
+        // 如果是还原操作
+        if (zhuanlanSavedState) {
+            try {
+                // 还原边栏
+                if (zhuanlanSavedState.sidebar && zhuanlanSavedState.sidebar.parent) {
+                    zhuanlanSavedState.sidebar.parent.appendChild(zhuanlanSavedState.sidebar.el);
+                }
+                // 还原文章样式
+                if (zhuanlanSavedState.article && zhuanlanSavedState.article.origStyle) {
+                    const art = zhuanlanSavedState.article.el;
+                    art.style.margin = zhuanlanSavedState.article.origStyle.margin;
+                    art.style.float = zhuanlanSavedState.article.origStyle.float;
+                    art.style.maxWidth = zhuanlanSavedState.article.origStyle.maxWidth;
+                }
+                // 还原导航链接（用 contains 检查 nextSibling 仍在 DOM 中，避免 insertBefore 抛异常）
+                if (zhuanlanSavedState.navItems) {
+                    zhuanlanSavedState.navItems.forEach(item => {
+                        if (item.parent && item.nextSibling && item.parent.contains(item.nextSibling)) {
+                            item.parent.insertBefore(item.el, item.nextSibling);
+                        } else if (item.parent) {
+                            item.parent.appendChild(item.el);
+                        }
+                    });
+                }
+                // 还原知乎直答按钮
+                if (zhuanlanSavedState.zhidaBtns) {
+                    zhuanlanSavedState.zhidaBtns.forEach(item => {
+                        if (item.parent && item.nextSibling && item.parent.contains(item.nextSibling)) {
+                            item.parent.insertBefore(item.el, item.nextSibling);
+                        } else if (item.parent) {
+                            item.parent.appendChild(item.el);
+                        }
+                    });
+                }
+            } catch (e) {
+                console.warn('专栏还原过程中出现异常:', e);
+            }
+            zhuanlanSavedState = null;
+            if (!skipSave) setZhuanlanOptimizedCookie('false');
+            return;
+        }
+
+        // 执行优化
+        const saved = {};
+
+        // 第一步：删除边栏并保存
+        const sidebar = document.querySelector('.css-1bcbfml');
+        if (sidebar) {
+            saved.sidebar = { el: sidebar, parent: sidebar.parentElement };
+            sidebar.remove();
+        }
+
+        // 第二步：让文章正文居中，保存原始样式
+        const article = document.querySelector('.css-12tmx22');
+        if (article) {
+            saved.article = {
+                el: article,
+                origStyle: {
+                    margin: article.style.margin,
+                    float: article.style.float,
+                    maxWidth: article.style.maxWidth
+                }
+            };
+            article.style.margin = '0 auto';
+            article.style.float = 'none';
+            article.style.maxWidth = '100%';
+        }
+
+        // 第三步：优化顶栏——保存并去除多余导航链接
+        saved.navItems = [];
+        document.querySelectorAll('div.css-c400lu').forEach(el => {
+            const text = el.textContent.trim();
+            if (text === '推荐' || text === '热榜' || text === '圈子' || text === '故事') {
+                const parent = el.closest('a') || el;
+                saved.navItems.push({
+                    el: parent,
+                    parent: parent.parentElement,
+                    nextSibling: parent.nextSibling
+                });
+                parent.remove();
+            }
+        });
+
+        // 保存并去除知乎直答按钮
+        saved.zhidaBtns = [];
+        document.querySelectorAll('a[href*="zhida.zhihu.com"]').forEach(el => {
+            saved.zhidaBtns.push({
+                el: el,
+                parent: el.parentElement,
+                nextSibling: el.nextSibling
+            });
+            el.remove();
+        });
+
+        zhuanlanSavedState = saved;
+        if (!skipSave) setZhuanlanOptimizedCookie('true');
+    }
+
     // ---------- 页面加载后的主初始化 ----------
     function init() {
         createUI();
@@ -1079,6 +1287,24 @@
                 addProfilePageBlockButton();
             });
             profileObserver.observe(document.body, { childList: true, subtree: true });
+        }
+
+        // —— 自动应用已保存的偏好 ——
+
+        // 专栏优化
+        if (location.hostname === 'zhuanlan.zhihu.com' && getZhuanlanOptimized()) {
+            toggleZhuanlanOptimize(true);
+        }
+
+        // 知乎直答链接处理
+        const savedZhidaMode = getZhidaMode();
+        if (savedZhidaMode !== 'disabled') {
+            applyZhidaMode(savedZhidaMode);
+            // 监听动态加载的内容，持续处理新出现的 zhida 链接
+            const zhidaObserver = new MutationObserver(() => {
+                applyZhidaMode(savedZhidaMode);
+            });
+            zhidaObserver.observe(document.body, { childList: true, subtree: true });
         }
     }
 
