@@ -376,6 +376,9 @@
 
         const blockedUsers = [];
 
+        // 跨排序去重集合：记录所有排序中已经处理过的用户 token
+        const processedTokens = new Set();
+
         let currentApiIndex = 0;
         let votersApi = apiCandidates[0];
         let pageOffset = 0;
@@ -383,7 +386,7 @@
         let handledUsers = 0;
         let estimatedUsers = 0;
 
-        while (!reachedLastPage && !shouldStop) {
+        while (!shouldStop) {
             const requestUrl = `${votersApi}?limit=10&offset=${pageOffset}`;
             try {
                 const listResponse = await fetchWithCreds(requestUrl);
@@ -392,6 +395,8 @@
                     if (currentApiIndex < apiCandidates.length - 1) {
                         currentApiIndex++;
                         votersApi = apiCandidates[currentApiIndex];
+                        pageOffset = 0;
+                        reachedLastPage = false;
                         appendLog(`已切换到备用 API：${votersApi}`);
                         continue;
                     } else {
@@ -400,6 +405,8 @@
                     }
                 }
                 const voterList = listPayload.data || [];
+                // 过滤掉其他排序中已处理过的用户，避免重复
+                const newVoters = voterList.filter(v => !processedTokens.has(v.url_token));
                 estimatedUsers += voterList.length;
 
                 for (const voterInfo of voterList) {
@@ -407,6 +414,9 @@
                         appendLog('用户已停止');
                         break;
                     }
+
+                    // 跨排序去重：标记此用户已被处理
+                    processedTokens.add(voterInfo.url_token);
 
                     handledUsers++;
                     const userId = voterInfo.id;
@@ -445,7 +455,20 @@
                 }
 
                 if (shouldStop) break;
-                reachedLastPage = !!(listPayload.paging && listPayload.paging.is_end);
+
+                if (listPayload.paging && listPayload.paging.is_end) {
+                    // 当前排序已到末尾，尝试下一个 API 候选
+                    if (currentApiIndex < apiCandidates.length - 1) {
+                        currentApiIndex++;
+                        votersApi = apiCandidates[currentApiIndex];
+                        pageOffset = 0;
+                        appendLog(`当前排序已拉取完毕，切换到下一个 API 以获取更多用户：${votersApi}`);
+                        continue;
+                    } else {
+                        reachedLastPage = true;
+                        break;
+                    }
+                }
                 pageOffset += 10;
             } catch (err) {
                 console.error('主循环错误：', err);
@@ -453,6 +476,7 @@
                 if (is404or405 && currentApiIndex < apiCandidates.length - 1) {
                     currentApiIndex++;
                     votersApi = apiCandidates[currentApiIndex];
+                    pageOffset = 0;
                     const code = err.message.includes('404') ? '404' : '405';
                     appendLog(`遇到 ${code} 错误，已切换到备用 API：${votersApi}`);
                     continue;
@@ -484,13 +508,19 @@
         if (answerMatch) {
             contentType = 'answer';
             contentId = answerMatch[2];
-            apiCandidates = [`https://www.zhihu.com/api/v4/answers/${contentId}/upvoters`];
+            // 两个排序：default（按粉丝量，默认）和 newest（按点赞时间），分别可获取最多约2000人，合并后可达约4000人
+            apiCandidates = [
+                `https://www.zhihu.com/api/v4/answers/${contentId}/upvoters?order=default`,
+                `https://www.zhihu.com/api/v4/answers/${contentId}/upvoters?order=newest`
+            ];
         } else if (articleMatch) {
             contentType = 'article';
             contentId = articleMatch[1];
             apiCandidates = [
-                `https://www.zhihu.com/api/v4/articles/${contentId}/voters`,
-                `https://www.zhihu.com/api/v4/articles/${contentId}/likers`
+                `https://www.zhihu.com/api/v4/articles/${contentId}/voters?order=default`,
+                `https://www.zhihu.com/api/v4/articles/${contentId}/voters?order=newest`,
+                `https://www.zhihu.com/api/v4/articles/${contentId}/likers?order=default`,
+                `https://www.zhihu.com/api/v4/articles/${contentId}/likers?order=newest`
             ];
         } else {
             alert('当前页面不是知乎回答或文章，无法使用此功能。');
@@ -505,8 +535,12 @@
 
     // ---------- 拉黑指定回答的点赞者（问题页面按钮使用） ----------
     async function blockAnswerUpvoters(answerId) {
+        // 两种排序：default（按粉丝量）和 newest（按点赞时间），合并可达约4000人
         await executeBlockFlow({
-            apiCandidates: [`https://www.zhihu.com/api/v4/answers/${answerId}/upvoters`],
+            apiCandidates: [
+                `https://www.zhihu.com/api/v4/answers/${answerId}/upvoters?order=default`,
+                `https://www.zhihu.com/api/v4/answers/${answerId}/upvoters?order=newest`
+            ],
             sourceLabel: `answer #${answerId} upvoters`
         });
     }
