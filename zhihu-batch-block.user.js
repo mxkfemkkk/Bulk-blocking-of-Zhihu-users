@@ -4,7 +4,9 @@
 // @version      2026-07-25
 // @description  Better Zhihu
 // @author       maxkk26
-// @match        https://*/*
+// @match        https://zhihu.com
+// @mach         https://zhuanlan.zhihu.com
+// @mach         https://www.zhihu.com
 // @icon         data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==
 // @grant        none
 // ==/UserScript==
