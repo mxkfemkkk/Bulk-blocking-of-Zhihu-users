@@ -1,12 +1,12 @@
 // ==UserScript==
-// @name         Block Zhihu User
+// @name         Zhihu PLUS 批量拉黑知乎用户和优化知乎网页版使用体验
 // @namespace    http://tampermonkey.net/
-// @version      2026-07-25
+// @version      2026-08-02
 // @description  Better Zhihu
 // @author       maxkk26
-// @match        https://zhihu.com
-// @mach         https://zhuanlan.zhihu.com
-// @mach         https://www.zhihu.com
+// @match        https://www.zhihu.com/*
+// @match        https://zhuanlan.zhihu.com/*
+// @match        https://zhihu.com/*
 // @icon         data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==
 // @grant        none
 // ==/UserScript==
@@ -171,6 +171,62 @@
         });
     }
 
+    // ====== 知乎超链接美化（正文内链接 = 蓝色 + 下划线，排除直答） ======
+
+    function applyLinkBeautify() {
+        // 只处理知乎主站和专栏的回答/文章正文
+        const bodySelectors = '.css-376mun, .css-1od93p9';
+        document.querySelectorAll(bodySelectors).forEach(container => {
+            container.querySelectorAll('a').forEach(link => {
+                // 跳过已处理和直答链接
+                if (link.dataset.zhLinkBeautified) return;
+                if (link.classList.contains('RichContent-EntityWord') || link.href.includes('zhida.zhihu.com')) return;
+
+                link.dataset.zhLinkBeautified = 'true';
+                link.style.setProperty('color', 'rgb(85, 142, 255)', 'important');
+                link.style.setProperty('text-decoration', 'underline', 'important');
+                link.style.setProperty('transition', 'color 0.15s', 'important');
+                link.addEventListener('mouseenter', () => {
+                    link.style.setProperty('color', '#7ec8e3', 'important');
+                }, { passive: true });
+                link.addEventListener('mouseleave', () => {
+                    link.style.setProperty('color', 'rgb(85, 142, 255)', 'important');
+                }, { passive: true });
+                link.addEventListener('mousedown', () => {
+                    link.style.setProperty('color', '#7ec8e3', 'important');
+                }, { passive: true });
+                link.addEventListener('mouseup', () => {
+                    link.style.setProperty('color', 'rgb(85, 142, 255)', 'important');
+                }, { passive: true });
+            });
+        });
+    }
+
+    // ====== 去除知乎超链接中转（link.zhihu.com/?target=...） ======
+
+    function removeLinkRedirect() {
+        document.querySelectorAll('a[href*="link.zhihu.com/?target="]').forEach(link => {
+            if (link.dataset.zhRedirectRemoved) return;
+            link.dataset.zhRedirectRemoved = 'true';
+
+            try {
+                const urlObj = new URL(link.href);
+                const target = urlObj.searchParams.get('target');
+                if (target) {
+                    const decodedTarget = decodeURIComponent(target);
+                    link.href = decodedTarget;
+                    // 外部链接新窗口打开
+                    if (!decodedTarget.startsWith('https://www.zhihu.com') && !decodedTarget.startsWith('/')) {
+                        link.target = '_blank';
+                        link.rel = 'noopener noreferrer';
+                    }
+                }
+            } catch (e) {
+                // 解析失败则跳过
+            }
+        });
+    }
+
     // ====== 专栏优化状态持久化 ======
 
     function getZhuanlanOptimized() {
@@ -274,6 +330,52 @@
         }
     };
 
+    // ---------- 并发控制：限制同时执行的任务数 ----------
+    async function pMapConcurrent(items, concurrency, fn) {
+        const results = [];
+        const executing = new Set();
+
+        for (let i = 0; i < items.length; i++) {
+            const p = Promise.resolve().then(() => fn(items[i], i)).then(r => {
+                executing.delete(p);
+                return r;
+            }, e => {
+                executing.delete(p);
+                throw e;
+            });
+            results.push(p);
+            executing.add(p);
+
+            if (executing.size >= concurrency) {
+                await Promise.race(executing);
+            }
+        }
+        return Promise.all(results);
+    }
+
+    // ---------- 带指数退避重试的拉黑（应对限流 429） ----------
+    async function blockUserWithRetry(userToken, maxRetries = 3) {
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                const response = await blockUser(userToken);
+                if (response.ok) return response;
+                if (response.status === 429) {
+                    const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
+                    console.warn(`拉黑 ${userToken} 被限流(429)，第 ${attempt} 次重试，等待 ${delay}ms`);
+                    await new Promise(r => setTimeout(r, delay));
+                    continue;
+                }
+                // 其他错误直接返回，不重试
+                return response;
+            } catch (e) {
+                if (attempt === maxRetries) throw e;
+                const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
+                console.warn(`拉黑 ${userToken} 异常(${e.message})，第 ${attempt} 次重试，等待 ${delay}ms`);
+                await new Promise(r => setTimeout(r, delay));
+            }
+        }
+    }
+
     async function getCurrentUserId() {
         try {
             if (window.__INITIAL_STATE__?.config?.currentUser?.urlToken) {
@@ -303,31 +405,142 @@
     }
 
     // 获取所有关注/粉丝ID（白名单）
+    // 双排序合并（default + created）突破知乎 API 每排序 ~500 人封顶限制
+    // 保留 120ms 页间延迟 + yield 点，避免对页面造成压力
     async function getAllUserIds(apiUrl) {
-        let allIds = new Set();
-        let offset = 0;
-        const limit = 20;
-        let isEnd = false;
+        const allIds = new Set();
+        const limit = 50;
+        const MAX_PAGES = 100;  // 安全阀，防无限循环
+        const orders = ['default', 'created'];
 
-        while (!isEnd) {
-            const url = `${apiUrl}?limit=${limit}&offset=${offset}`;
-            try {
-                const response = await fetchWithCreds(url);
-                const data = await safeJson(response);
-                if (!data) break;
-                const users = data.data || [];
-                users.forEach(user => allIds.add(String(user.id)));
-                isEnd = data.paging && data.paging.is_end;
-                offset += limit;
-            } catch (e) {
-                console.error(`Failed to fetch data (${url}):`, e);
-                break;
+        for (const order of orders) {
+            let offset = 0;
+            let isEnd = false;
+            let pageCount = 0;
+
+            while (!isEnd && pageCount < MAX_PAGES) {
+                const url = `${apiUrl}?order=${order}&limit=${limit}&offset=${offset}`;
+                try {
+                    const response = await fetchWithCreds(url);
+                    const data = await safeJson(response);
+                    if (!data) break;
+                    const users = data.data || [];
+                    users.forEach(user => allIds.add(String(user.id)));
+                    // paging 缺失时视为已结束，避免无限循环
+                    isEnd = !data.paging || data.paging.is_end === true;
+                    offset += limit;
+                    pageCount++;
+                    // 分页间短暂延迟，防止高频请求压垮页面
+                    if (!isEnd) {
+                        await new Promise(r => setTimeout(r, 120));
+                    }
+                } catch (e) {
+                    console.error(`获取白名单失败 (${url}):`, e);
+                    break;
+                }
             }
         }
         return allIds;
     }
 
+    // ---------- 从知乎 API 拉取当前用户的真实黑名单 ----------
+    // 尝试多个候选端点，分页拉取，返回 [{url_token, name, id}] 数组
+    async function fetchZhihuBlockedList(meToken) {
+        const candidates = [
+            `https://www.zhihu.com/api/v4/members/${meToken}/blocks`,
+            `https://www.zhihu.com/api/v4/me/blocks`,
+            `https://www.zhihu.com/api/v4/members/${meToken}/blocked-users`
+        ];
+
+        for (const baseUrl of candidates) {
+            const list = [];
+            let offset = 0;
+            const limit = 50;
+            let isEnd = false;
+            let pageCount = 0;
+            let ok = false;
+
+            try {
+                while (!isEnd && pageCount < 100) {
+                    const url = `${baseUrl}?limit=${limit}&offset=${offset}`;
+                    const resp = await fetchWithCreds(url);
+                    const data = await safeJson(resp);
+                    if (!data || !data.data) {
+                        break;
+                    }
+                    ok = true;
+                    for (const u of data.data) {
+                        list.push({
+                            url_token: u.url_token,
+                            name: u.name,
+                            id: u.id
+                        });
+                    }
+                    isEnd = !data.paging || data.paging.is_end === true;
+                    offset += limit;
+                    pageCount++;
+                    if (!isEnd) {
+                        await new Promise(r => setTimeout(r, 120));
+                    }
+                }
+            } catch (e) {
+                console.warn(`黑名单端点 ${baseUrl} 拉取失败:`, e.message);
+                continue; // 尝试下一个候选端点
+            }
+
+            if (ok && list.length > 0) {
+                console.log(`从知乎拉取到黑名单 ${list.length} 人（端点: ${baseUrl}）`);
+                return list;
+            }
+            // 空列表视为端点不可用，继续尝试下一个
+        }
+        console.warn('所有黑名单端点均不可用，保留本地黑名单。');
+        return null; // 返回 null 表示拉取失败
+    }
+
+    // 将知乎真实黑名单同步到本地 blockedTokens + localStorage
+    // 仅在远程拉取到非空黑名单时才执行合并（防止误清空本地记录）
+    async function syncBlockedUsersFromZhihu() {
+        const me = await getCurrentUserId();
+        if (!me) return false;
+
+        const remote = await fetchZhihuBlockedList(me);
+        if (!remote || remote.length === 0) return false;
+
+        // 合并到本地 Set
+        let changed = 0;
+        const existing = loadBlockedUsers();
+        const merged = existing.slice();
+        const seen = new Set(existing.map(u => u.token));
+
+        for (const u of remote) {
+            if (!u.url_token) continue;
+            if (!seen.has(u.url_token)) {
+                merged.push({ token: u.url_token, name: u.name, time: Date.now() });
+                changed++;
+            }
+            blockedTokens.add(u.url_token);
+            seen.add(u.url_token);
+        }
+
+        // 清理本地存在但知乎已不在黑名单中的记录
+        const remoteTokens = new Set(remote.map(u => u.url_token).filter(Boolean));
+        const pruned = merged.filter(u => remoteTokens.has(u.token));
+        const prunedCount = merged.length - pruned.length;
+        if (prunedCount > 0) {
+            blockedTokens.clear();
+            pruned.forEach(u => blockedTokens.add(u.token));
+        }
+
+        localStorage.setItem(BLOCKED_KEY, JSON.stringify(pruned));
+        console.log(`黑名单同步完成：新增 ${changed} 人，移除 ${prunedCount} 人，本地共 ${pruned.length} 人`);
+        return true;
+    }
+
     // ---------- 核心拉黑流程（抽取公用，供不同入口调用） ----------
+    // 优化策略：① 两阶段——先预取全部点赞者，再统一拉黑
+    //           ② 拉黑阶段并发执行（3路并行），带限流重试
+    //           ③ 分页加大到 50，减少请求次数
     async function executeBlockFlow({ apiCandidates, sourceLabel }) {
         const MY_USER_ID = await getCurrentUserId();
         if (!MY_USER_ID) {
@@ -335,12 +548,7 @@
             return;
         }
 
-        // 白名单
-        const followees = await getAllUserIds(`https://www.zhihu.com/api/v4/members/${MY_USER_ID}/followees`);
-        const followers = await getAllUserIds(`https://www.zhihu.com/api/v4/members/${MY_USER_ID}/followers`);
-        const safeUserIds = new Set([...followees, ...followers]);
-
-        // UI 进度框
+        // 先创建 UI（让 appendLog 可用）
         const infoDiv = document.createElement('div');
         infoDiv.style.cssText = getInfoDivStyle();
         document.body.appendChild(infoDiv);
@@ -372,126 +580,154 @@
             return `<a href="https://www.zhihu.com/people/${userToken}" target="_blank">${userToken}</a>`;
         }
 
+        const startTime = Date.now();
+
+        // 同步当前用户的真实黑名单到本地
+        appendLog('正在同步你的黑名单...');
+        await syncBlockedUsersFromZhihu();
+
+        // 白名单（每次拉黑请求都重新获取）
         appendLog('正在获取你的关注和粉丝列表（白名单）...');
+        const followees = await getAllUserIds(`https://www.zhihu.com/api/v4/members/${MY_USER_ID}/followees`);
+        const followers = await getAllUserIds(`https://www.zhihu.com/api/v4/members/${MY_USER_ID}/followers`);
+        const safeUserIds = new Set([...followees, ...followers]);
+
         appendLog(`白名单人数：${safeUserIds.size} 人（关注 + 粉丝）`);
         appendLog('─────────────────────────────');
 
-        const blockedUsers = [];
+        // ========== 第一阶段：预取所有排序的全部点赞者，本地去重 ==========
+        appendLog('正在获取点赞列表（多个排序，自动去重）...');
 
-        // 跨排序去重集合：记录所有排序中已经处理过的用户 token
-        const processedTokens = new Set();
+        const allVoters = new Map();  // url_token -> voterInfo
+        let apiErrors = [];
 
-        let currentApiIndex = 0;
-        let votersApi = apiCandidates[0];
-        let pageOffset = 0;
-        let reachedLastPage = false;
-        let handledUsers = 0;
-        let estimatedUsers = 0;
+        for (const baseUrl of apiCandidates) {
+            let offset = 0;
+            const PAGE_SIZE = 50;
+            let isEnd = false;
+            let pageCount = 0;
 
-        while (!shouldStop) {
-            const requestUrl = `${votersApi}?limit=10&offset=${pageOffset}`;
-            try {
-                const listResponse = await fetchWithCreds(requestUrl);
-                const listPayload = await safeJson(listResponse);
-                if (!listPayload) {
-                    if (currentApiIndex < apiCandidates.length - 1) {
-                        currentApiIndex++;
-                        votersApi = apiCandidates[currentApiIndex];
-                        pageOffset = 0;
-                        reachedLastPage = false;
-                        appendLog(`已切换到备用 API：${votersApi}`);
-                        continue;
-                    } else {
-                        appendLog('所有 API 返回空数据，终止执行');
+            while (!isEnd && !shouldStop) {
+                const url = `${baseUrl}&limit=${PAGE_SIZE}&offset=${offset}`;
+                try {
+                    const resp = await fetchWithCreds(url);
+                    const data = await safeJson(resp);
+                    if (!data || !data.data) {
+                        if (data === null) break; // 空响应，跳过此候选
                         break;
                     }
-                }
-                const voterList = listPayload.data || [];
-                // 过滤掉其他排序中已处理过的用户，避免重复
-                const newVoters = voterList.filter(v => !processedTokens.has(v.url_token));
-                estimatedUsers += voterList.length;
-
-                for (const voterInfo of voterList) {
-                    if (shouldStop) {
-                        appendLog('用户已停止');
-                        break;
+                    for (const v of data.data) {
+                        if (!allVoters.has(v.url_token)) {
+                            allVoters.set(v.url_token, v);
+                        }
                     }
-
-                    // 跨排序去重：标记此用户已被处理
-                    processedTokens.add(voterInfo.url_token);
-
-                    handledUsers++;
-                    const userId = voterInfo.id;
-                    const userName = voterInfo.name;
-                    const userToken = voterInfo.url_token;
-                    const profileUrl = `https://www.zhihu.com${voterInfo.url}`;
-
-                    // 只跳过白名单，不再进行小号判断
-                    if (safeUserIds.has(String(userId))) {
-                        appendLog(`已跳过（白名单）：${userName} (${tokenLink(userToken)}) [${handledUsers}/${estimatedUsers}]`);
-                        continue;
+                    isEnd = !data.paging || data.paging.is_end === true;
+                    offset += PAGE_SIZE;
+                    pageCount++;
+                    // yield 点：每 5 页让出事件循环，避免长时间阻塞主线程
+                    if (pageCount % 5 === 0) {
+                        await new Promise(r => setTimeout(r, 0));
                     }
-
-                    // 已拉黑用户标记后跳过
-                    if (blockedTokens.has(userToken)) {
-                        appendLog(`${userName}（已屏蔽）(${tokenLink(userToken)}) [${handledUsers}/${estimatedUsers}]`);
-                        continue;
-                    }
-
-                    // 直接拉黑
-                    const actionResponse = await blockUser(userToken);
-                    if (actionResponse.ok) {
-                        blockedUsers.push({ userName, userToken, profileUrl });
-                        // 记录已拉黑用户
-                        saveBlockedUser(userToken, userName);
-                        blockedTokens.add(userToken);
-                        const msg = `已屏蔽：${userName} (${tokenLink(userToken)}) [${handledUsers}/${estimatedUsers}]`;
-                        appendLog(msg);
-                        // ---- 控制台显示拉黑进度 ----
-                        console.log(`[已拉黑] ${userName} - 主页：https://www.zhihu.com/people/${userToken}`);
-                    } else {
-                        const errText = await actionResponse.text().catch(() => '');
-                        appendLog(`失败：${userName} (${tokenLink(userToken)}) 状态 ${actionResponse.status}`);
-                        console.warn(`拉黑失败 ${userName}: ${actionResponse.status} - ${errText}`);
-                    }
-                }
-
-                if (shouldStop) break;
-
-                if (listPayload.paging && listPayload.paging.is_end) {
-                    // 当前排序已到末尾，尝试下一个 API 候选
-                    if (currentApiIndex < apiCandidates.length - 1) {
-                        currentApiIndex++;
-                        votersApi = apiCandidates[currentApiIndex];
-                        pageOffset = 0;
-                        appendLog(`当前排序已拉取完毕，切换到下一个 API 以获取更多用户：${votersApi}`);
-                        continue;
-                    } else {
-                        reachedLastPage = true;
-                        break;
-                    }
-                }
-                pageOffset += 10;
-            } catch (err) {
-                console.error('主循环错误：', err);
-                const is404or405 = err.message && (err.message.includes('404') || err.message.includes('405'));
-                if (is404or405 && currentApiIndex < apiCandidates.length - 1) {
-                    currentApiIndex++;
-                    votersApi = apiCandidates[currentApiIndex];
-                    pageOffset = 0;
-                    const code = err.message.includes('404') ? '404' : '405';
-                    appendLog(`遇到 ${code} 错误，已切换到备用 API：${votersApi}`);
-                    continue;
-                } else {
-                    break;
+                } catch (err) {
+                    console.warn(`获取点赞列表失败 (${url}):`, err);
+                    apiErrors.push({ url, error: err.message });
+                    break; // 跳过此候选
                 }
             }
+            if (shouldStop) break;
         }
 
-        if (shouldStop) {
-            appendLog('用户已停止，未完全完成。');
+        if (apiErrors.length > 0 && allVoters.size === 0) {
+            appendLog('所有 API 均失败，无法获取点赞用户列表。');
+            return;
         }
-        appendLog(`执行完毕！共拉黑：${blockedUsers.length} 人`);
+
+        if (allVoters.size === 0) {
+            appendLog('未获取到任何点赞用户。');
+            return;
+        }
+
+        // ========== 第二阶段：本地过滤（白名单 + 已拉黑） ==========
+        appendLog(`获取到 ${allVoters.size} 名不同用户，正在过滤白名单和已拉黑用户...`);
+
+        const toBlock = [];
+        const skippedWhitelist = [];
+        const skippedBlocked = [];
+
+        for (const [token, info] of allVoters) {
+            if (safeUserIds.has(String(info.id))) {
+                skippedWhitelist.push(info);
+                continue;
+            }
+            if (blockedTokens.has(token)) {
+                skippedBlocked.push(info);
+                continue;
+            }
+            toBlock.push(info);
+        }
+
+        appendLog(`需拉黑：${toBlock.length} 人 | 白名单跳过：${skippedWhitelist.length} 人 | 已拉黑跳过：${skippedBlocked.length} 人`);
+        appendLog('─────────────────────────────');
+
+        // 过滤完成后弹窗，显示完整统计（含已拉黑跳过人数）
+        if (!confirm(`白名单跳过 ${skippedWhitelist.length} 人 | 已拉黑跳过 ${skippedBlocked.length} 人\n需拉黑 ${toBlock.length} 人\n\n确定要继续执行拉黑操作吗？`)) {
+            appendLog('用户取消了拉黑操作。');
+            return;
+        }
+
+        if (toBlock.length === 0) {
+            appendLog('没有需要拉黑的用户。');
+            return;
+        }
+
+        // ========== 第三阶段：并发拉黑（3路并行，带重试） ==========
+        appendLog(`开始拉黑（3 路并发）...`);
+        const CONCURRENCY = 3;
+        const blockedUsers = [];
+        let completedCount = 0;
+        let failCount = 0;
+
+        const blockOne = async (voterInfo) => {
+            if (shouldStop) return;
+
+            const userName = voterInfo.name;
+            const userToken = voterInfo.url_token;
+            const profileUrl = `https://www.zhihu.com${voterInfo.url}`;
+
+            try {
+                const actionResponse = await blockUserWithRetry(userToken);
+                if (actionResponse.ok) {
+                    blockedUsers.push({ userName, userToken, profileUrl });
+                    saveBlockedUser(userToken, userName);
+                    blockedTokens.add(userToken);
+                    completedCount++;
+                    appendLog(`[已屏蔽] ${userName} (${tokenLink(userToken)}) [${completedCount + failCount}/${toBlock.length}]`);
+                    console.log(`[已拉黑] ${userName} - 主页：https://www.zhihu.com/people/${userToken}`);
+                } else {
+                    failCount++;
+                    const errText = await actionResponse.text().catch(() => '');
+                    appendLog(`[失败] ${userName} (${tokenLink(userToken)}) 状态 ${actionResponse.status} [${completedCount + failCount}/${toBlock.length}]`);
+                    console.warn(`拉黑失败 ${userName}: ${actionResponse.status} - ${errText}`);
+                }
+            } catch (err) {
+                failCount++;
+                appendLog(`[异常] ${userName} (${tokenLink(userToken)}) ${err.message} [${completedCount + failCount}/${toBlock.length}]`);
+                console.error(`拉黑异常 ${userName}:`, err);
+            }
+        };
+
+        await pMapConcurrent(toBlock, CONCURRENCY, blockOne);
+
+        // 拉黑完成后，用最新数据标注点赞弹窗内的用户名
+        labelVoterPopupFromData(toBlock);
+
+        const elapsed = Math.round((Date.now() - startTime) / 1000);
+
+        if (shouldStop) {
+            appendLog(`[中断] 用户已停止，未完全完成。`);
+        }
+        appendLog(`─────────────────────────────`);
+        appendLog(`执行完毕！共拉黑：${blockedUsers.length} 人，失败：${failCount} 人，用时 ${elapsed} 秒`);
         console.log(`====== 已拉黑用户 (${sourceLabel}) ======`);
         console.table(blockedUsers);
         console.log('总拉黑数：', blockedUsers.length);
@@ -547,7 +783,7 @@
         });
     }
 
-    // ---------- 在每个回答操作栏「分享」右侧添加「🚫拉黑」按钮 ----------
+    // ---------- 在每个回答操作栏「分享」右侧添加「拉黑」按钮 ----------
     function addBlockButtonsToActionBar() {
         if (!/^https:\/\/www\.zhihu\.com\/question\/\d+$/.test(location.href)) return;
 
@@ -567,7 +803,7 @@
 
             const btn = document.createElement('button');
             btn.className = 'zhihu-block-action-btn';
-            btn.innerHTML = '🚫拉黑';
+            btn.innerHTML = '[拉黑]';
             btn.style.cssText = `
                 margin-left: 8px;
                 padding: 0 10px;
@@ -590,11 +826,11 @@
             btn.addEventListener('click', (e) => {
                 e.stopPropagation();
                 if (btn.disabled) return;
-                btn.innerHTML = '⏳执行中...';
+                btn.innerHTML = '[执行中...]';
                 btn.disabled = true;
                 btn.style.background = '#bbb';
                 blockAnswerUpvoters(answerId).finally(() => {
-                    btn.innerHTML = '🚫拉黑';
+                    btn.innerHTML = '[拉黑]';
                     btn.disabled = false;
                     btn.style.background = '#999';
                 });
@@ -642,45 +878,45 @@
         return null;
     }
 
-    // ---------- 在已拉黑用户的用户名后追加「（已拉黑）」 ----------
-    function setupBlockedLabel() {
-        const observer = new MutationObserver(() => {
-            const selector = [
-                '.UserLink-link:not(.zhihu-labeled)',                   // 用户名链接
-                '.CommentItem a[href*="/people/"]:not(.zhihu-labeled)'  // 评论区用户名
-            ].join(', ');
+    // ---------- 标注已拉黑用户（由统一 Observer 节流调用，不内嵌独立 Observer） ----------
+    function labelBlockedLinks() {
+        // 覆盖所有带 /people/ 的 <a>：正文、评论区、点赞弹窗、关注列表等
+        const selector = 'a[href*="/people/"]:not(.zhihu-labeled)';
 
-            document.querySelectorAll(selector).forEach(link => {
-                const match = link.href && link.href.match(/\/people\/([^/?&]+)/);
-                if (!match) return;
-                const token = match[1];
+        document.querySelectorAll(selector).forEach(link => {
+            const match = link.href && link.href.match(/\/people\/([^/?&]+)/);
+            if (!match) return;
+            const token = match[1];
 
-                link.classList.add('zhihu-labeled');
+            link.classList.add('zhihu-labeled');
 
-                // 过滤数字文本（如点赞数 "123"）或空文本
-                const text = link.textContent.trim();
-                if (/^\d+$/.test(text) || text.length === 0) return;
-                if (text.includes('（已拉黑）')) return;
+            // 跳过空文本或纯数字文本（如点赞数 "123"）
+            const text = link.textContent.trim();
+            if (/^\d+$/.test(text) || text.length === 0) return;
+            if (text.includes('（已拉黑）')) return;
 
-                if (blockedTokens.has(token)) {
-                    // 先在用户名后追加文字（即时响应本地缓存）
-                    link.append('（已拉黑）');
-
-                    // 异步验证真实拉黑状态，如果已取消则清理
-                    verifyBlockedStatus(token).then(isBlocked => {
-                        if (!isBlocked) {
-                            removeBlockedUser(token);
-                            const textNode = [...link.childNodes].find(n =>
-                                n.nodeType === Node.TEXT_NODE && n.textContent.includes('（已拉黑）')
-                            );
-                            if (textNode) textNode.remove();
-                        }
-                    });
-                }
-            });
+            if (blockedTokens.has(token)) {
+                link.append('（已拉黑）');
+            }
         });
+    }
 
-        observer.observe(document.body, { childList: true, subtree: true });
+    // 主动标注点赞弹窗：拉黑流程拿到数据后，直接找到弹窗内元素追加标记
+    function labelVoterPopupFromData(voters) {
+        if (!voters || voters.length === 0) return;
+        const popupContainer = document.querySelector('.VoterList, [class*="VoterList"], .Modal-content');
+        if (!popupContainer) return;
+
+        for (const voter of voters) {
+            if (!blockedTokens.has(voter.url_token)) continue;
+            const link = popupContainer.querySelector(
+                `a[href*="/people/${voter.url_token}"]`
+            );
+            if (link && !link.textContent.includes('（已拉黑）')) {
+                link.classList.add('zhihu-labeled');
+                link.append('（已拉黑）');
+            }
+        }
     }
 
     // ---------- 拉黑答主的粉丝（无小号判断，三次确认） ----------
@@ -748,7 +984,10 @@
             return;
         }
 
-        // 获取白名单
+        // 同步当前用户的真实黑名单到本地
+        await syncBlockedUsersFromZhihu();
+
+        // 获取白名单（每次拉黑请求都重新获取）
         const followees = await getAllUserIds(`https://www.zhihu.com/api/v4/members/${MY_USER_ID}/followees`);
         const followers = await getAllUserIds(`https://www.zhihu.com/api/v4/members/${MY_USER_ID}/followers`);
         const safeUserIds = new Set([...followees, ...followers]);
@@ -787,68 +1026,39 @@
             return `<a href="https://www.zhihu.com/people/${userToken}" target="_blank">${userToken}</a>`;
         }
 
+        const startTime = Date.now();
+
         appendLog('正在获取作者的粉丝列表（排除白名单）...');
         appendLog(`白名单人数：${safeUserIds.size} 人（你的关注 + 粉丝）`);
         appendLog('─────────────────────────────');
 
-        const blockedUsers = [];
+        // ========== 第一阶段：预取全部粉丝 ==========
+        appendLog('正在获取全部粉丝...');
 
+        const allFans = new Map();  // url_token -> fanInfo
         let offset = 0;
-        const limit = 20;
+        const PAGE_SIZE = 50;
         let isEnd = false;
-        let handled = 0;
-        let estimated = 0;
+        let pageCount = 0;
 
         while (!isEnd && !shouldStop) {
-            const url = `${fansApi}?limit=${limit}&offset=${offset}`;
+            const url = `${fansApi}?limit=${PAGE_SIZE}&offset=${offset}`;
             try {
                 const response = await fetchWithCreds(url);
                 const data = await safeJson(response);
                 if (!data) break;
-                const fans = data.data || [];
-                estimated += fans.length;
-
-                for (const fan of fans) {
-                    if (shouldStop) {
-                        appendLog('用户已停止');
-                        break;
-                    }
-                    handled++;
-                    const userId = fan.id;
-                    const userName = fan.name;
-                    const userToken = fan.url_token;
-                    const profileUrl = `https://www.zhihu.com${fan.url}`;
-
-                    if (safeUserIds.has(String(userId))) {
-                        appendLog(`已跳过（白名单）：${userName} (${tokenLink(userToken)}) [${handled}/${estimated}]`);
-                        continue;
-                    }
-
-                    // 已拉黑用户标记后跳过
-                    if (blockedTokens.has(userToken)) {
-                        appendLog(`${userName}（已屏蔽）(${tokenLink(userToken)}) [${handled}/${estimated}]`);
-                        continue;
-                    }
-
-                    const actionResponse = await blockUser(userToken);
-                    if (actionResponse.ok) {
-                        blockedUsers.push({ userName, userToken, profileUrl });
-                        // 记录已拉黑用户
-                        saveBlockedUser(userToken, userName);
-                        blockedTokens.add(userToken);
-                        appendLog(`已屏蔽：${userName} (${tokenLink(userToken)}) [${handled}/${estimated}]`);
-                        // ---- 控制台显示拉黑进度 ----
-                        console.log(`[已拉黑] ${userName} - 主页：https://www.zhihu.com/people/${userToken}`);
-                    } else {
-                        const errText = await actionResponse.text().catch(() => '');
-                        appendLog(`失败：${userName} (${tokenLink(userToken)}) 状态 ${actionResponse.status}`);
-                        console.warn(`拉黑失败 ${userName}: ${actionResponse.status} - ${errText}`);
+                for (const fan of (data.data || [])) {
+                    if (!allFans.has(fan.url_token)) {
+                        allFans.set(fan.url_token, fan);
                     }
                 }
-
-                if (shouldStop) break;
-                isEnd = data.paging && data.paging.is_end;
-                offset += limit;
+                isEnd = !data.paging || data.paging.is_end === true;
+                offset += PAGE_SIZE;
+                pageCount++;
+                // yield 点：每 5 页让出事件循环，避免长时间阻塞主线程
+                if (pageCount % 5 === 0) {
+                    await new Promise(r => setTimeout(r, 0));
+                }
             } catch (e) {
                 console.error('获取粉丝列表出错：', e);
                 appendLog('获取粉丝列表出错：' + e.message);
@@ -856,10 +1066,91 @@
             }
         }
 
-        if (shouldStop) {
-            appendLog('用户已停止，未完全完成。');
+        if (allFans.size === 0) {
+            appendLog('未获取到任何粉丝。');
+            return;
         }
-        appendLog(`执行完毕！共拉黑：${blockedUsers.length} 人`);
+
+        // ========== 第二阶段：本地过滤 ==========
+        appendLog(`获取到 ${allFans.size} 名粉丝，正在过滤白名单和已拉黑用户...`);
+
+        const toBlock = [];
+        const skippedWhitelist = [];
+        const skippedBlocked = [];
+
+        for (const [token, info] of allFans) {
+            if (safeUserIds.has(String(info.id))) {
+                skippedWhitelist.push(info);
+                continue;
+            }
+            if (blockedTokens.has(token)) {
+                skippedBlocked.push(info);
+                continue;
+            }
+            toBlock.push(info);
+        }
+
+        appendLog(`需拉黑：${toBlock.length} 人 | 白名单跳过：${skippedWhitelist.length} 人 | 已拉黑跳过：${skippedBlocked.length} 人`);
+        appendLog('─────────────────────────────');
+
+        // 过滤完成后弹窗，显示完整统计（含已拉黑跳过人数）
+        if (!confirm(`白名单跳过 ${skippedWhitelist.length} 人 | 已拉黑跳过 ${skippedBlocked.length} 人\n需拉黑 ${toBlock.length} 人\n\n确定要继续执行拉黑操作吗？`)) {
+            return;
+        }
+
+        if (toBlock.length === 0) {
+            appendLog('没有需要拉黑的用户。');
+            return;
+        }
+
+        // ========== 第三阶段：并发拉黑 ==========
+        appendLog(`开始拉黑（3 路并发）...`);
+        const CONCURRENCY = 3;
+        const blockedUsers = [];
+        let completedCount = 0;
+        let failCount = 0;
+
+        const blockOne = async (fanInfo) => {
+            if (shouldStop) return;
+
+            const userName = fanInfo.name;
+            const userToken = fanInfo.url_token;
+            const profileUrl = `https://www.zhihu.com${fanInfo.url}`;
+
+            try {
+                const actionResponse = await blockUserWithRetry(userToken);
+                if (actionResponse.ok) {
+                    blockedUsers.push({ userName, userToken, profileUrl });
+                    saveBlockedUser(userToken, userName);
+                    blockedTokens.add(userToken);
+                    completedCount++;
+                    appendLog(`[已屏蔽] ${userName} (${tokenLink(userToken)}) [${completedCount + failCount}/${toBlock.length}]`);
+                    console.log(`[已拉黑] ${userName} - 主页：${profileUrl}`);
+                } else {
+                    failCount++;
+                    const errText = await actionResponse.text().catch(() => '');
+                    appendLog(`[失败] ${userName} (${tokenLink(userToken)}) 状态 ${actionResponse.status} [${completedCount + failCount}/${toBlock.length}]`);
+                    console.warn(`拉黑失败 ${userName}: ${actionResponse.status} - ${errText}`);
+                }
+            } catch (err) {
+                failCount++;
+                appendLog(`[异常] ${userName} (${tokenLink(userToken)}) ${err.message} [${completedCount + failCount}/${toBlock.length}]`);
+                console.error(`拉黑异常 ${userName}:`, err);
+            }
+        };
+
+        await pMapConcurrent(toBlock, CONCURRENCY, blockOne);
+
+        // 拉黑完成后标注弹窗
+        labelVoterPopupFromData(toBlock);
+
+        const elapsed = Math.round((Date.now() - startTime) / 1000);
+
+        if (shouldStop) {
+            appendLog(`[中断] 用户已停止，未完全完成。`);
+        }
+        appendLog(`─────────────────────────────`);
+        appendLog(`执行完毕！共拉黑：${blockedUsers.length} 人，失败：${failCount} 人，用时 ${elapsed} 秒`);
         console.log('====== 拉黑作者粉丝完成 ======');
         console.table(blockedUsers);
         console.log('总拉黑数：', blockedUsers.length);
@@ -1300,29 +1591,28 @@
     function init() {
         createUI();
 
-        // 在已拉黑用户的用户名后追加「（已拉黑）」
-        setupBlockedLabel();
+        // 后台同步知乎真实黑名单到本地（不影响页面加载，异步执行）
+        syncBlockedUsersFromZhihu().then(ok => {
+            if (ok) {
+                // 同步完成后刷新一次标注
+                labelBlockedLinks();
+            }
+        }).catch(e => console.warn('黑名单同步失败:', e));
 
-        // 如果是问题页面，在操作栏添加「🚫拉黑」按钮
+        // 需要响应 DOM 变化的处理函数集合
+        const domHandlers = [];
+
+        // 标注已拉黑用户
+        domHandlers.push(labelBlockedLinks);
+
+        // 问题页面：操作栏「拉黑」按钮
         if (/^https:\/\/www\.zhihu\.com\/question\/\d+$/.test(location.href)) {
-            addBlockButtonsToActionBar();
-            // 监听动态加载的回答（无限滚动）
-            const pageObserver = new MutationObserver(() => {
-                addBlockButtonsToActionBar();
-            });
-            pageObserver.observe(document.body, { childList: true, subtree: true });
+            domHandlers.push(addBlockButtonsToActionBar);
         }
 
-        // 如果是个人主页，添加「拉黑 Ta」按钮
+        // 个人主页：添加「拉黑 Ta」按钮
         if (isProfilePage()) {
-            // 初始尝试
-            addProfilePageBlockButton();
-
-            // 监听 DOM 变化，等待关注按钮加载完成
-            const profileObserver = new MutationObserver(() => {
-                addProfilePageBlockButton();
-            });
-            profileObserver.observe(document.body, { childList: true, subtree: true });
+            domHandlers.push(addProfilePageBlockButton);
         }
 
         // —— 自动应用已保存的偏好 ——
@@ -1335,13 +1625,33 @@
         // 知乎直答链接处理
         const savedZhidaMode = getZhidaMode();
         if (savedZhidaMode !== 'disabled') {
-            applyZhidaMode(savedZhidaMode);
-            // 监听动态加载的内容，持续处理新出现的 zhida 链接
-            const zhidaObserver = new MutationObserver(() => {
-                applyZhidaMode(savedZhidaMode);
-            });
-            zhidaObserver.observe(document.body, { childList: true, subtree: true });
+            domHandlers.push(() => applyZhidaMode(savedZhidaMode));
         }
+
+        // —— 超链接美化 + 去除中转（自动应用，无需菜单） ——
+        domHandlers.push(() => { applyLinkBeautify(); removeLinkRedirect(); });
+
+        // 统一 MutationObserver：防抖批量执行所有 DOM 处理（替代原来多个独立 Observer）
+        let scheduled = false;
+        const runHandlers = () => {
+            scheduled = false;
+            for (const fn of domHandlers) {
+                try { fn(); } catch (e) { console.warn('DOM 处理出错:', e); }
+            }
+        };
+
+        // 首次执行
+        runHandlers();
+
+        const observer = new MutationObserver(() => {
+            if (scheduled) return;
+            scheduled = true;
+            // 用双重延时（rAF + setTimeout）合并高频 DOM 变更，避免频繁全量扫描
+            requestAnimationFrame(() => {
+                setTimeout(runHandlers, 120);
+            });
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
     }
 
     if (document.readyState === 'loading') {
