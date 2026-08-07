@@ -153,20 +153,28 @@
         if (mode === 'disabled') return;
         const selector = 'a.RichContent-EntityWord[href*="zhida.zhihu.com"], a[href*="zhida.zhihu.com"]';
         document.querySelectorAll(selector).forEach(el => {
-            if (el.dataset.zhidaProcessed) return;
-            el.dataset.zhidaProcessed = 'true';
+            // 已处理且未被 React 恢复原样时跳过；React 重渲染恢复 zhida 链接后重新处理
+            const alreadyDone = el.dataset.zhidaProcessed === mode &&
+                (mode === 'google' ? el.href.startsWith('https://www.google.com/search') : !el.hasAttribute('href'));
+            if (alreadyDone) return;
+
+            const text = el.textContent.trim();
+            if (!text) return; // 空文本保护：文本未渲染时跳过（不标记），等后续 MutationObserver 周期再处理
+
+            el.dataset.zhidaProcessed = mode;
 
             if (mode === 'google') {
-                const query = el.textContent.trim();
-                el.href = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+                el.href = `https://www.google.com/search?q=${encodeURIComponent(text)}`;
                 el.target = '_blank';
                 el.rel = 'noopener noreferrer';
             } else if (mode === 'plain') {
-                const text = el.textContent;
-                const span = document.createElement('span');
-                span.textContent = text;
-                span.style.cssText = window.getComputedStyle(el).cssText;
-                el.parentNode.replaceChild(span, el);
+                // 保留节点、仅去除链接语义（不用 replaceChild，避免破坏 React 渲染导致文本丢失）
+                el.removeAttribute('href');
+                el.removeAttribute('target');
+                el.removeAttribute('rel');
+                el.classList.remove('RichContent-EntityWord');
+                // 折叠子节点为纯文本：保留全部文字、移除 ✦ 角标等图标元素
+                el.textContent = text;
             }
         });
     }
@@ -180,7 +188,7 @@
             container.querySelectorAll('a').forEach(link => {
                 // 跳过已处理和直答链接
                 if (link.dataset.zhLinkBeautified) return;
-                if (link.classList.contains('RichContent-EntityWord') || link.href.includes('zhida.zhihu.com')) return;
+                if (link.dataset.zhidaProcessed || link.classList.contains('RichContent-EntityWord') || link.href.includes('zhida.zhihu.com')) return;
 
                 link.dataset.zhLinkBeautified = 'true';
                 link.style.setProperty('color', 'rgb(85, 142, 255)', 'important');
@@ -1572,9 +1580,10 @@
             }
         });
 
-        // 保存并去除知乎直答按钮
+        // 保存并去除知乎直答按钮（保留正文实体链接，交给直答模式处理）
         saved.zhidaBtns = [];
         document.querySelectorAll('a[href*="zhida.zhihu.com"]').forEach(el => {
+            if (el.classList.contains('RichContent-EntityWord')) return; // 正文实体链接不删除
             saved.zhidaBtns.push({
                 el: el,
                 parent: el.parentElement,
