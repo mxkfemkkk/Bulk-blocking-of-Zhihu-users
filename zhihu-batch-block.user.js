@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zhihu PLUS 批量拉黑知乎用户和优化知乎网页版使用体验
 // @namespace    http://tampermonkey.net/
-// @version      2026-08-07
+// @version      2026-08-08
 // @description  Better Zhihu
 // @author       maxkk26
 // @match        https://www.zhihu.com/*
@@ -465,105 +465,104 @@
     }
 
     // 获取所有关注/粉丝ID（白名单）
-    // 多候选排序（默认 + created）合并去重：部分端点单排序存在约500-600人的服务器上限，
-    // created 若被支持则可突破该上限；单候选失败/被拒时自动跳过，不影响其余候选
+    // 优先跟随服务端 paging.next 翻页（实测：自拼 offset 分页存在约 580 人的服务端上限，
+    // 跟随 paging.next 可获取全量粉丝）；paging.next 缺失/非字符串时回退自拼 offset
     async function getAllUserIds(apiUrl) {
         const allIds = new Set();
         const limit = 50;
         const MAX_PAGES = 100;   // 安全阀，防无限循环
-        const orders = ['', 'created']; // 空 = 默认排序
+        let offset = 0;
+        let nextUrl = null;
+        let isEnd = false;
+        let pageCount = 0;
 
-        for (const order of orders) {
-            const orderParam = order ? `&order=${order}` : '';
-            let offset = 0;
-            let isEnd = false;
-            let pageCount = 0;
-            let gotAny = false;
-
-            while (!isEnd && pageCount < MAX_PAGES) {
-                const url = `${apiUrl}?limit=${limit}&offset=${offset}${orderParam}`;
-                try {
-                    const response = await fetchWithCreds(url);
-                    const data = await safeJson(response);
-                    if (!data || !data.data) break; // 空响应/参数不被支持 → 跳过该候选
-                    const users = data.data || [];
-                    // 使用 String(user.id) 确保类型一致（新版用到 String 转换）
-                    users.forEach(user => allIds.add(String(user.id)));
-                    gotAny = gotAny || users.length > 0;
-                    // paging 缺失时视为已结束，避免无限循环
-                    isEnd = !data.paging || data.paging.is_end === true;
-                    offset += limit;
-                    pageCount++;
-                    // 分页间短暂延迟，防止高频请求压垮页面
-                    if (!isEnd) {
-                        await new Promise(r => setTimeout(r, 80));
-                    }
-                } catch (e) {
-                    console.warn(`获取白名单候选失败 (${url}):`, e.message);
-                    break; // 跳过该候选，不中断其他候选
+        while (!isEnd && pageCount < MAX_PAGES) {
+            // 首页自拼，后续页优先跟随 paging.next（服务端自带 limit=20，原样使用）
+            const url = pageCount === 0
+                ? `${apiUrl}?limit=${limit}&offset=${offset}`
+                : (nextUrl || `${apiUrl}?limit=${limit}&offset=${offset}`);
+            try {
+                const response = await fetchWithCreds(url);
+                const data = await safeJson(response);
+                if (!data || !data.data) break; // 空响应/参数不被支持 → 停止
+                const users = data.data || [];
+                // 使用 String(user.id) 确保类型一致（新版用到 String 转换）
+                users.forEach(user => allIds.add(String(user.id)));
+                nextUrl = (data.paging && typeof data.paging.next === 'string' && data.paging.next) ? data.paging.next : null;
+                // paging 缺失时视为已结束，避免无限循环
+                isEnd = !data.paging || data.paging.is_end === true;
+                offset += limit;
+                pageCount++;
+                // 分页间短暂延迟，防止高频请求压垮页面
+                if (!isEnd) {
+                    await new Promise(r => setTimeout(r, 80));
                 }
-            }
-
-            if (!gotAny) {
-                console.warn(`白名单候选 order=${order || 'default'} 未返回任何用户，已跳过`);
+            } catch (e) {
+                console.warn(`获取白名单失败 (${url}):`, e.message);
+                break;
             }
         }
         return allIds;
     }
 
     // ---------- 从知乎 API 拉取当前用户的真实黑名单 ----------
-    // 尝试多个候选端点，分页拉取，返回 [{url_token, name, id}] 数组
-    async function fetchZhihuBlockedList(meToken) {
-        const candidates = [
-            `https://www.zhihu.com/api/v4/members/${meToken}/blocks`,
-            `https://www.zhihu.com/api/v4/me/blocks`,
-            `https://www.zhihu.com/api/v4/members/${meToken}/blocked-users`
-        ];
+    // 端点：/api/v3/settings/blocked_users（设置页 /settings/filter 的真实接口；
+    // 旧的 /api/v4/me/blocks 系列已废弃，实测 404）
+    // 分页跟随 paging.next（与白名单同一成熟模式，可突破自拼 offset 的上限），返回 { list, completed }
+    async function fetchZhihuBlockedList(meToken, opts = {}) {
+        const { maxPages = 100, onProgress, isCancelled } = opts;
+        const baseUrl = 'https://www.zhihu.com/api/v3/settings/blocked_users';
+        const seen = new Map(); // url_token -> {url_token, name, id}（去重）
+        const limit = 50;
+        let offset = 0;
+        let nextUrl = null;
+        let isEnd = false;
+        let completed = false;
+        let pageCount = 0;
+        let ok = false;
 
-        for (const baseUrl of candidates) {
-            const list = [];
-            let offset = 0;
-            const limit = 50;
-            let isEnd = false;
-            let pageCount = 0;
-            let ok = false;
-
-            try {
-                while (!isEnd && pageCount < 100) {
-                    const url = `${baseUrl}?limit=${limit}&offset=${offset}`;
-                    const resp = await fetchWithCreds(url);
-                    const data = await safeJson(resp);
-                    if (!data || !data.data) {
-                        break;
-                    }
-                    ok = true;
-                    for (const u of data.data) {
-                        list.push({
-                            url_token: u.url_token,
-                            name: u.name,
-                            id: u.id
-                        });
-                    }
-                    isEnd = !data.paging || data.paging.is_end === true;
-                    offset += limit;
-                    pageCount++;
-                    if (!isEnd) {
-                        await new Promise(r => setTimeout(r, 120));
-                    }
+        try {
+            while (!isEnd && pageCount < maxPages) {
+                if (isCancelled && isCancelled()) break;
+                // 首页自拼，后续页优先跟随 paging.next（原样使用其自带 limit）
+                const url = pageCount === 0
+                    ? `${baseUrl}?limit=${limit}&offset=${offset}`
+                    : (nextUrl || `${baseUrl}?limit=${limit}&offset=${offset}`);
+                let resp = await fetchWithCreds(url);
+                if (resp.status === 429) {
+                    // 限流退避重试一次
+                    await new Promise(r => setTimeout(r, 1000));
+                    resp = await fetchWithCreds(url);
                 }
-            } catch (e) {
-                console.warn(`黑名单端点 ${baseUrl} 拉取失败:`, e.message);
-                continue; // 尝试下一个候选端点
+                const data = await safeJson(resp);
+                if (!data || !data.data) break;
+                ok = true;
+                for (const u of data.data) {
+                    const key = u.url_token || String(u.id || '');
+                    if (!key || seen.has(key)) continue;
+                    seen.set(key, { url_token: u.url_token, name: u.name, id: u.id });
+                }
+                nextUrl = (data.paging && typeof data.paging.next === 'string' && data.paging.next) ? data.paging.next : null;
+                isEnd = !data.paging || data.paging.is_end === true;
+                if (isEnd) completed = true;
+                if (data.data.length === 0) break; // 防空转：空 data + is_end:false 时不再翻页
+                offset += limit;
+                pageCount++;
+                if (pageCount % 10 === 0 && onProgress) onProgress(seen.size);
+                if (!isEnd) {
+                    await new Promise(r => setTimeout(r, 120));
+                }
             }
-
-            if (ok && list.length > 0) {
-                console.log(`从知乎拉取到黑名单 ${list.length} 人（端点: ${baseUrl}）`);
-                return list;
-            }
-            // 空列表视为端点不可用，继续尝试下一个
+        } catch (e) {
+            console.warn(`黑名单端点 ${baseUrl} 拉取失败:`, e.message);
         }
-        console.warn('所有黑名单端点均不可用，保留本地黑名单。');
-        return null; // 返回 null 表示拉取失败
+
+        if (ok && seen.size > 0) {
+            console.log(`从知乎拉取到黑名单 ${seen.size} 人（端点: ${baseUrl}）`);
+            return { list: [...seen.values()], completed };
+        }
+        console.warn('黑名单端点不可用，保留本地黑名单。');
+        return { list: [], completed: false };
     }
 
     // 将知乎真实黑名单同步到本地 blockedTokens + localStorage
@@ -572,8 +571,9 @@
         const me = await getCurrentUserId();
         if (!me) return false;
 
-        const remote = await fetchZhihuBlockedList(me);
-        if (!remote || remote.length === 0) return false;
+        // maxPages=50 限制后台拉取量（约 1000-2500 人覆盖，与现状相当），避免每次页面加载拉 100+ 页
+        const remote = await fetchZhihuBlockedList(me, { maxPages: 50 });
+        if (!remote || remote.list.length === 0) return false;
 
         // 合并到本地 Set
         let changed = 0;
@@ -581,7 +581,7 @@
         const merged = existing.slice();
         const seen = new Set(existing.map(u => u.token));
 
-        for (const u of remote) {
+        for (const u of remote.list) {
             if (!u.url_token) continue;
             if (!seen.has(u.url_token)) {
                 merged.push({ token: u.url_token, name: u.name, time: Date.now() });
@@ -592,16 +592,23 @@
         }
 
         // 清理本地存在但知乎已不在黑名单中的记录
-        const remoteTokens = new Set(remote.map(u => u.url_token).filter(Boolean));
-        const pruned = merged.filter(u => remoteTokens.has(u.token));
-        const prunedCount = merged.length - pruned.length;
-        if (prunedCount > 0) {
-            blockedTokens.clear();
-            pruned.forEach(u => blockedTokens.add(u.token));
+        // 仅完整拉取（completed）时执行 prune，防止按部分拉取结果误删本地记录
+        let finalList = merged;
+        let prunedCount = 0;
+        if (remote.completed) {
+            const remoteTokens = new Set(remote.list.map(u => u.url_token).filter(Boolean));
+            finalList = merged.filter(u => remoteTokens.has(u.token));
+            prunedCount = merged.length - finalList.length;
+            if (prunedCount > 0) {
+                blockedTokens.clear();
+                finalList.forEach(u => blockedTokens.add(u.token));
+            }
+            console.log(`黑名单同步完成：新增 ${changed} 人，移除 ${prunedCount} 人，本地共 ${finalList.length} 人`);
+        } else {
+            console.log(`黑名单同步完成（部分拉取，保留本地记录）：新增 ${changed} 人，本地共 ${finalList.length} 人`);
         }
 
-        localStorage.setItem(BLOCKED_KEY, JSON.stringify(pruned));
-        console.log(`黑名单同步完成：新增 ${changed} 人，移除 ${prunedCount} 人，本地共 ${pruned.length} 人`);
+        localStorage.setItem(BLOCKED_KEY, JSON.stringify(finalList));
         return true;
     }
 
@@ -1235,20 +1242,25 @@
             const sep = baseUrl.includes('?') ? '&' : '?'; // 点赞者 base 已含 ?order=，粉丝/关注 base 是干净的
             let offset = 0;
             const limit = 50;
+            let nextUrl = null;
             let isEnd = false;
             let pageCount = 0;
             try {
                 while (!isEnd && pageCount < 100) {
-                    const url = `${baseUrl}${sep}limit=${limit}&offset=${offset}`;
+                    // 首页自拼，后续页优先跟随 paging.next（实测可突破自拼 offset 分页的 ~580 人上限）
+                    const url = pageCount === 0
+                        ? `${baseUrl}${sep}limit=${limit}&offset=${offset}`
+                        : (nextUrl || `${baseUrl}${sep}limit=${limit}&offset=${offset}`);
                     const resp = await fetchWithCreds(url);
                     const data = await safeJson(resp);
                     if (!data || !data.data) break;
                     for (const u of data.data) {
-                        // 多排序合并时首个候选优先
+                        // 多候选合并时首个候选优先
                         if (u.url_token && !allUsers.has(u.url_token)) {
                             allUsers.set(u.url_token, u);
                         }
                     }
+                    nextUrl = (data.paging && typeof data.paging.next === 'string' && data.paging.next) ? data.paging.next : null;
                     isEnd = !data.paging || data.paging.is_end === true;
                     offset += limit;
                     pageCount++;
@@ -1396,7 +1408,8 @@
     }
 
     // 共享导出流程：选择格式 → 进度框 → 收集 → 下载
-    async function exportUsersFlow({ label, getUsers }) {
+    // splitSize 可选：人数超出时按 ≤splitSize/份 拆分为多文件（黑名单导出用 3000）
+    async function exportUsersFlow({ label, getUsers, splitSize }) {
         const format = await askExportFormat('导出' + label);
         if (!format) return; // 取消：连进度框都不创建
 
@@ -1411,7 +1424,7 @@
         const btnContainer = document.createElement('div');
         btnContainer.style.textAlign = 'center';
         const closeBtn = document.createElement('button');
-        closeBtn.textContent = '关闭';
+        closeBtn.textContent = '停止';
         closeBtn.style.padding = '4px 16px';
         btnContainer.appendChild(closeBtn);
         infoDiv.appendChild(btnContainer);
@@ -1420,17 +1433,29 @@
             logArea.innerHTML += html + '<br>';
             logArea.scrollTop = logArea.scrollHeight;
         }
-        closeBtn.addEventListener('click', () => infoDiv.remove());
+
+        let stopped = false;   // 收集期间点击：停止收集；收集完成后点击：关闭窗口
+        let collecting = true;
+        closeBtn.addEventListener('click', () => {
+            if (collecting) {
+                stopped = true;
+                console.log('用户请求停止收集');
+            } else {
+                infoDiv.remove();
+            }
+        });
 
         appendLog(`正在导出${label}...`);
         let users = [];
         try {
-            users = await getUsers(appendLog);
+            users = await getUsers(appendLog, { isCancelled: () => stopped });
         } catch (e) {
             appendLog('导出失败：' + e.message);
             console.error('导出失败:', e);
             return;
         }
+        collecting = false;
+        closeBtn.textContent = '关闭';
 
         if (!users || users.length === 0) {
             appendLog('没有可导出的用户。');
@@ -1438,13 +1463,40 @@
         }
 
         const ext = format === 'csv' ? 'csv' : 'json';
-        const filename = `zhihu_${label}_${exportTimestamp()}.${ext}`;
-        if (format === 'csv') {
-            downloadFile(filename, toCsv(users), 'text/csv;charset=utf-8');
+        const ts = exportTimestamp(); // 时间戳只算一次，各分片文件共用
+        // 多文件拆分
+        const chunks = [];
+        if (splitSize && users.length > splitSize) {
+            for (let i = 0; i < users.length; i += splitSize) chunks.push(users.slice(i, i + splitSize));
         } else {
-            downloadFile(filename, toJson(users), 'application/json;charset=utf-8');
+            chunks.push(users);
         }
-        appendLog(`导出完成：共 ${users.length} 人，文件 ${filename}`);
+
+        if (chunks.length > 1) {
+            // confirm 同时获得 transient activation，绕过 Chrome 多文件下载提示
+            const ok = confirm(`共 ${users.length} 人，将导出为 ${chunks.length} 个文件（每个 ≤${splitSize} 人）\n\n确定继续导出吗？`);
+            if (!ok) {
+                appendLog('用户取消了导出。');
+                return;
+            }
+        }
+
+        if (stopped) appendLog(`[中断] 已停止收集，导出已收集的 ${users.length} 人。`);
+
+        for (let i = 0; i < chunks.length; i++) {
+            const suffix = chunks.length > 1 ? `_part${i + 1}of${chunks.length}` : '';
+            const filename = `zhihu_${label}_${ts}${suffix}.${ext}`;
+            if (format === 'csv') {
+                downloadFile(filename, toCsv(chunks[i]), 'text/csv;charset=utf-8');
+            } else {
+                downloadFile(filename, toJson(chunks[i]), 'application/json;charset=utf-8');
+            }
+            appendLog(`导出完成：第 ${i + 1}/${chunks.length} 份，${chunks[i].length} 人，文件 ${filename}`);
+            if (i < chunks.length - 1) {
+                await new Promise(r => setTimeout(r, 800)); // 分片间间隔，避免连续下载被拦截
+            }
+        }
+        appendLog(`导出完成：共 ${users.length} 人，${chunks.length} 份文件`);
     }
 
     // ---------- 导出入口：点赞用户（回答/文章页） ----------
@@ -1530,6 +1582,15 @@
 
     // ---------- 导出入口：自身黑名单用户 ----------
     async function exportBlockedUsers() {
+        // 专栏页（zhuanlan.zhihu.com）跨域 CORS，无法访问 www.zhihu.com 的黑名单接口，
+        // 且 localStorage 与主站隔离（无本地记录），提示前往主站导出
+        if (!/^(www\.)?zhihu\.com$/.test(location.hostname)) {
+            if (confirm('黑名单导出需要知乎主站（www.zhihu.com）。\n当前页面（' + location.hostname + '）无法访问黑名单接口。\n\n点击「确定」前往首页导出？')) {
+                location.href = 'https://www.zhihu.com/';
+            }
+            return;
+        }
+
         const me = await getCurrentUserId();
         if (!me) {
             alert('无法获取你的用户ID，请重新登录后重试。');
@@ -1537,14 +1598,21 @@
         }
 
         await exportUsersFlow({
-            label: '黑名单用户',
-            getUsers: async (log) => {
-                // 优先从知乎 API 拉取真实黑名单
-                const remote = await fetchZhihuBlockedList(me);
-                if (remote && remote.length > 0) {
-                    return remote.filter(u => u.url_token).map(u => normalizeExportUser(u));
+            label: '黑名单用户（时间很长）',
+            splitSize: 3000, // 黑名单可达 1w+，按 3000 人/份拆分为多文件
+            getUsers: async (log, ctx) => {
+                // 优先从知乎 API 拉取真实黑名单（paging.next 全量翻页）
+                const remote = await fetchZhihuBlockedList(me, {
+                    maxPages: 2500, // 知乎黑名单上限 50k；next limit=20 时约需 2500 页，is_end 会提前终止
+                    onProgress: (count) => log(`已拉取 ${count} 人...`),
+                    isCancelled: ctx && ctx.isCancelled
+                });
+                if (remote.list.length > 0) {
+                    log(`从知乎拉取到 ${remote.list.length} 人`);
+                    return remote.list.filter(u => u.url_token).map(u => normalizeExportUser(u));
                 }
                 // 兜底：本地黑名单记录（键名为 token）
+                log('知乎接口不可用，使用本地黑名单记录...');
                 return loadBlockedUsers()
                     .filter(u => u.token)
                     .map(u => normalizeExportUser({ url_token: u.token, name: u.name }));
