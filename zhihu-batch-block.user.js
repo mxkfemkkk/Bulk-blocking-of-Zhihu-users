@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zhihu PLUS 批量拉黑知乎用户和优化知乎网页版使用体验
 // @namespace    http://tampermonkey.net/
-// @version      2026-08-02
+// @version      2026-08-07
 // @description  Better Zhihu
 // @author       maxkk26
 // @match        https://www.zhihu.com/*
@@ -11,7 +11,7 @@
 // @grant        none
 // ==/UserScript==
 
-(function() {
+(function () {
     'use strict';
 
     // ====== 已拉黑用户追踪（localStorage 持久化 + 快速 Set） ======
@@ -59,14 +59,14 @@
                 const state = window.__INITIAL_STATE__;
                 if (state) {
                     const isBlocked = state?.people?.profile?.isBlocked ??
-                                      state?.people?.isBlocked ??
-                                      state?.profile?.isBlocked;
+                        state?.people?.isBlocked ??
+                        state?.profile?.isBlocked;
                     if (typeof isBlocked === 'boolean') {
                         verifiedBlockCache.set(userToken, isBlocked);
                         return isBlocked;
                     }
                 }
-            } catch (e) {}
+            } catch (e) { }
         }
 
         // 通过知乎 API 获取用户关系状态
@@ -87,7 +87,7 @@
                 verifiedBlockCache.set(userToken, isBlocked);
                 return isBlocked;
             }
-        } catch (e) {}
+        } catch (e) { }
 
         // 无法确定，回退到本地缓存
         verifiedBlockCache.set(userToken, blockedTokens.has(userToken));
@@ -110,8 +110,8 @@
         }
 
         return document.documentElement.getAttribute('data-theme') === 'dark' ||
-               document.documentElement.classList.contains('dark') ||
-               window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+            document.documentElement.classList.contains('dark') ||
+            window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
     }
 
     function isDarkMode() {
@@ -151,11 +151,14 @@
 
     function applyZhidaMode(mode) {
         if (mode === 'disabled') return;
-        const selector = 'a.RichContent-EntityWord[href*="zhida.zhihu.com"], a[href*="zhida.zhihu.com"]';
+        const selector = 'a.RichContent-EntityWord[href*="zhida.zhihu.com"], a[href*="zhida.zhihu.com"], a[data-paste-text="true"]';
         document.querySelectorAll(selector).forEach(el => {
             // 已处理且未被 React 恢复原样时跳过；React 重渲染恢复 zhida 链接后重新处理
+            // 「已处理」以污染标志是否还在为准：旧格式已删 href 但残留控制属性（data-paste-text 等）时仍需重处理
             const alreadyDone = el.dataset.zhidaProcessed === mode &&
-                (mode === 'google' ? el.href.startsWith('https://www.google.com/search') : !el.hasAttribute('href'));
+                (mode === 'google'
+                    ? el.href.startsWith('https://www.google.com/search')
+                    : !el.hasAttribute('href') && !el.hasAttribute('data-paste-text') && !el.hasAttribute('data-za-not-track-link'));
             if (alreadyDone) return;
 
             const text = el.textContent.trim();
@@ -173,40 +176,89 @@
                 el.removeAttribute('target');
                 el.removeAttribute('rel');
                 el.classList.remove('RichContent-EntityWord');
+                el.classList.remove('css-1x3bg93'); // 新格式实体蓝色样式类（hash 类名，配合下一条兜底）
+                el.style.setProperty('color', 'inherit', 'important'); // 强制继承正文颜色，深浅色主题均正确
                 // 折叠子节点为纯文本：保留全部文字、移除 ✦ 角标等图标元素
                 el.textContent = text;
             }
+
+            // 删除直答污染控制属性（新格式），避免知乎 JS 仍把它当直答实体处理（点击唤起看山）
+            // google 模式也要删：若属性残留，知乎的点击拦截可能抢在 Google 链接跳转前唤起看山
+            el.removeAttribute('data-paste-text');
+            el.removeAttribute('data-za-not-track-link');
         });
+    }
+
+    // ====== 知乎超链接美化开关（cookie 持久化，默认开启） ======
+
+    function getLinkBeautifyEnabled() {
+        const cookieMatch = document.cookie.match(/(?:^|;\s*)zhihu_link_beautify=([^;]+)/);
+        if (cookieMatch) return decodeURIComponent(cookieMatch[1]) === 'true';
+        return true; // 默认开启
+    }
+
+    function setLinkBeautifyEnabled(enabled) {
+        const expires = '; max-age=31536000; path=/';
+        const domain = location.hostname.endsWith('zhihu.com') ? '; domain=.zhihu.com' : '';
+        document.cookie = `zhihu_link_beautify=${enabled}${expires}${domain}`;
+    }
+
+    // 模块级状态：事件回调中快速判断，避免每次读 cookie
+    let linkBeautifyEnabled = getLinkBeautifyEnabled();
+
+    function toggleLinkBeautify() {
+        linkBeautifyEnabled = !linkBeautifyEnabled;
+        setLinkBeautifyEnabled(linkBeautifyEnabled);
+        applyLinkBeautify(); // 立即对当前页面生效（开启=应用，关闭=还原）
+        return linkBeautifyEnabled;
     }
 
     // ====== 知乎超链接美化（正文内链接 = 蓝色 + 下划线，排除直答） ======
 
     function applyLinkBeautify() {
+        if (!linkBeautifyEnabled) { undoLinkBeautify(); return; }
         // 只处理知乎主站和专栏的回答/文章正文
         const bodySelectors = '.css-376mun, .css-1od93p9';
         document.querySelectorAll(bodySelectors).forEach(container => {
             container.querySelectorAll('a').forEach(link => {
                 // 跳过已处理和直答链接
                 if (link.dataset.zhLinkBeautified) return;
-                if (link.dataset.zhidaProcessed || link.classList.contains('RichContent-EntityWord') || link.href.includes('zhida.zhihu.com')) return;
+                if (link.dataset.zhidaProcessed || link.classList.contains('RichContent-EntityWord') || link.href.includes('zhida.zhihu.com') || link.hasAttribute('data-paste-text')) return;
 
                 link.dataset.zhLinkBeautified = 'true';
                 link.style.setProperty('color', 'rgb(85, 142, 255)', 'important');
                 link.style.setProperty('text-decoration', 'underline', 'important');
                 link.style.setProperty('transition', 'color 0.15s', 'important');
-                link.addEventListener('mouseenter', () => {
-                    link.style.setProperty('color', '#7ec8e3', 'important');
-                }, { passive: true });
-                link.addEventListener('mouseleave', () => {
-                    link.style.setProperty('color', 'rgb(85, 142, 255)', 'important');
-                }, { passive: true });
-                link.addEventListener('mousedown', () => {
-                    link.style.setProperty('color', '#7ec8e3', 'important');
-                }, { passive: true });
-                link.addEventListener('mouseup', () => {
-                    link.style.setProperty('color', 'rgb(85, 142, 255)', 'important');
-                }, { passive: true });
+                if (!link.dataset.zhLinkBeautifyBound) {
+                    link.dataset.zhLinkBeautifyBound = 'true';
+                    link.addEventListener('mouseenter', () => {
+                        if (!linkBeautifyEnabled) return;
+                        link.style.setProperty('color', '#7ec8e3', 'important');
+                    }, { passive: true });
+                    link.addEventListener('mouseleave', () => {
+                        if (!linkBeautifyEnabled) return;
+                        link.style.setProperty('color', 'rgb(85, 142, 255)', 'important');
+                    }, { passive: true });
+                    link.addEventListener('mousedown', () => {
+                        if (!linkBeautifyEnabled) return;
+                        link.style.setProperty('color', '#7ec8e3', 'important');
+                    }, { passive: true });
+                    link.addEventListener('mouseup', () => {
+                        if (!linkBeautifyEnabled) return;
+                        link.style.setProperty('color', 'rgb(85, 142, 255)', 'important');
+                    }, { passive: true });
+                }
             });
+        });
+    }
+
+    // 还原美化的内联样式（监听器保留但会因开关检查空转；绑定标记保留，避免重复绑定）
+    function undoLinkBeautify() {
+        document.querySelectorAll('a[data-zh-link-beautified]').forEach(link => {
+            delete link.dataset.zhLinkBeautified;
+            link.style.removeProperty('color');
+            link.style.removeProperty('text-decoration');
+            link.style.removeProperty('transition');
         });
     }
 
@@ -391,7 +443,7 @@
                 console.log(`Auto detected user ID: ${userId}`);
                 return userId;
             }
-        } catch (e) {}
+        } catch (e) { }
 
         try {
             const response = await fetchWithCreds('https://www.zhihu.com/api/v4/me');
@@ -413,39 +465,47 @@
     }
 
     // 获取所有关注/粉丝ID（白名单）
-    // 双排序合并（default + created）突破知乎 API 每排序 ~500 人封顶限制
-    // 保留 120ms 页间延迟 + yield 点，避免对页面造成压力
+    // 多候选排序（默认 + created）合并去重：部分端点单排序存在约500-600人的服务器上限，
+    // created 若被支持则可突破该上限；单候选失败/被拒时自动跳过，不影响其余候选
     async function getAllUserIds(apiUrl) {
         const allIds = new Set();
         const limit = 50;
-        const MAX_PAGES = 100;  // 安全阀，防无限循环
-        const orders = ['default', 'created'];
+        const MAX_PAGES = 100;   // 安全阀，防无限循环
+        const orders = ['', 'created']; // 空 = 默认排序
 
         for (const order of orders) {
+            const orderParam = order ? `&order=${order}` : '';
             let offset = 0;
             let isEnd = false;
             let pageCount = 0;
+            let gotAny = false;
 
             while (!isEnd && pageCount < MAX_PAGES) {
-                const url = `${apiUrl}?order=${order}&limit=${limit}&offset=${offset}`;
+                const url = `${apiUrl}?limit=${limit}&offset=${offset}${orderParam}`;
                 try {
                     const response = await fetchWithCreds(url);
                     const data = await safeJson(response);
-                    if (!data) break;
+                    if (!data || !data.data) break; // 空响应/参数不被支持 → 跳过该候选
                     const users = data.data || [];
+                    // 使用 String(user.id) 确保类型一致（新版用到 String 转换）
                     users.forEach(user => allIds.add(String(user.id)));
+                    gotAny = gotAny || users.length > 0;
                     // paging 缺失时视为已结束，避免无限循环
                     isEnd = !data.paging || data.paging.is_end === true;
                     offset += limit;
                     pageCount++;
                     // 分页间短暂延迟，防止高频请求压垮页面
                     if (!isEnd) {
-                        await new Promise(r => setTimeout(r, 120));
+                        await new Promise(r => setTimeout(r, 80));
                     }
                 } catch (e) {
-                    console.error(`获取白名单失败 (${url}):`, e);
-                    break;
+                    console.warn(`获取白名单候选失败 (${url}):`, e.message);
+                    break; // 跳过该候选，不中断其他候选
                 }
+            }
+
+            if (!gotAny) {
+                console.warn(`白名单候选 order=${order || 'default'} 未返回任何用户，已跳过`);
             }
         }
         return allIds;
@@ -856,7 +916,7 @@
             try {
                 const parsed = JSON.parse(zop);
                 if (parsed.answerId) return String(parsed.answerId);
-            } catch (e) {}
+            } catch (e) { }
         }
 
         // 尝试 data-za-detail 属性
@@ -865,7 +925,7 @@
             try {
                 const parsed = JSON.parse(zaDetail);
                 if (parsed.answer_id) return String(parsed.answer_id);
-            } catch (e) {}
+            } catch (e) { }
         }
 
         // 尝试查找包含 answer ID 的链接
@@ -1164,6 +1224,360 @@
         console.log('总拉黑数：', blockedUsers.length);
     }
 
+    // ==========================================================
+    // ========== 导出用户功能 ==========
+    // ==========================================================
+
+    // 通用分页收集用户（多候选端点 + Map 去重），返回 [{name, url_token, profileUrl}]
+    async function collectUsersPaged(baseUrls, appendLog) {
+        const allUsers = new Map(); // url_token -> 原始记录
+        for (const baseUrl of baseUrls) {
+            const sep = baseUrl.includes('?') ? '&' : '?'; // 点赞者 base 已含 ?order=，粉丝/关注 base 是干净的
+            let offset = 0;
+            const limit = 50;
+            let isEnd = false;
+            let pageCount = 0;
+            try {
+                while (!isEnd && pageCount < 100) {
+                    const url = `${baseUrl}${sep}limit=${limit}&offset=${offset}`;
+                    const resp = await fetchWithCreds(url);
+                    const data = await safeJson(resp);
+                    if (!data || !data.data) break;
+                    for (const u of data.data) {
+                        // 多排序合并时首个候选优先
+                        if (u.url_token && !allUsers.has(u.url_token)) {
+                            allUsers.set(u.url_token, u);
+                        }
+                    }
+                    isEnd = !data.paging || data.paging.is_end === true;
+                    offset += limit;
+                    pageCount++;
+                    // yield 点：每 5 页让出事件循环，避免长时间阻塞主线程
+                    if (pageCount % 5 === 0) {
+                        if (appendLog) appendLog(`已获取 ${allUsers.size} 人...`);
+                        await new Promise(r => setTimeout(r, 0));
+                    }
+                }
+            } catch (e) {
+                console.warn(`收集用户失败 (${baseUrl}):`, e.message);
+                // 单候选失败：跳过该候选，保留已收集数据
+            }
+        }
+        return [...allUsers.values()].map(normalizeExportUser);
+    }
+
+    // 统一导出记录形状：{name, url_token, profileUrl}
+    function normalizeExportUser(u) {
+        const token = u.url_token || u.token || '';
+        return {
+            name: u.name || token || '(未知)',
+            url_token: token,
+            profileUrl: u.url ? `https://www.zhihu.com${u.url}` : `https://www.zhihu.com/people/${token}`
+        };
+    }
+
+    // CSV 字段转义：含逗号/引号/换行的字段加双引号，内部引号翻倍
+    function csvEscape(field) {
+        const str = String(field == null ? '' : field);
+        return /[",\r\n]/.test(str) ? '"' + str.replace(/"/g, '""') + '"' : str;
+    }
+
+    // 生成 CSV 内容：BOM 前缀（Excel 中文兼容）+ CRLF 换行
+    function toCsv(users) {
+        const header = ['用户名', '用户token', '个人主页链接'];
+        const rows = users.map(u => [u.name, u.url_token, u.profileUrl].map(csvEscape).join(','));
+        return '\uFEFF' + [header.join(','), ...rows].join('\r\n') + '\r\n';
+    }
+
+    // 生成 JSON 内容（英文键名）
+    function toJson(users) {
+        return JSON.stringify(users, null, 2);
+    }
+
+    // 导出文件名时间戳：YYYYMMDD_HHMMSS
+    function exportTimestamp() {
+        const d = new Date();
+        const p = n => String(n).padStart(2, '0');
+        return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+    }
+
+    // 下载文件到本地
+    function downloadFile(filename, content, mimeType) {
+        const blob = new Blob([content], { type: mimeType });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+    }
+
+    // 导出格式选择弹窗（Promise）：resolve 'csv' | 'json' | null（取消）
+    function askExportFormat(title) {
+        return new Promise(resolve => {
+            const isDark = isDarkMode();
+            const btnStyle = `
+                display: block; width: 100%; margin: 8px 0; padding: 10px 0;
+                background: ${isDark ? '#3d3d3d' : '#f0f0f0'};
+                color: ${isDark ? '#e0e0e0' : '#000'};
+                border: 1px solid ${isDark ? '#555' : '#ccc'};
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 14px;
+                font-family: '微软雅黑', sans-serif;
+            `;
+
+            const overlay = document.createElement('div');
+            overlay.style.cssText = `
+                position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+                background: rgba(0,0,0,0.45); z-index: 100000;
+                display: flex; align-items: center; justify-content: center;
+            `;
+
+            const box = document.createElement('div');
+            box.style.cssText = `
+                background: ${isDark ? '#2d2d2d' : '#fff'};
+                color: ${isDark ? '#e0e0e0' : '#000'};
+                padding: 24px 32px;
+                border-radius: 8px;
+                box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+                font-family: '微软雅黑', sans-serif;
+                font-size: 14px;
+                min-width: 300px;
+                text-align: center;
+            `;
+
+            const titleEl = document.createElement('div');
+            titleEl.textContent = title;
+            titleEl.style.cssText = 'font-size: 16px; font-weight: bold; margin-bottom: 8px;';
+
+            const hintEl = document.createElement('div');
+            hintEl.textContent = '请选择导出格式（A 或 B）';
+            hintEl.style.cssText = `color: ${isDark ? '#999' : '#666'}; margin-bottom: 16px; font-size: 13px;`;
+
+            const btnCsv = document.createElement('button');
+            btnCsv.textContent = 'A. 导出为 CSV 表格';
+            btnCsv.style.cssText = btnStyle;
+            const btnJson = document.createElement('button');
+            btnJson.textContent = 'B. 导出为 JSON';
+            btnJson.style.cssText = btnStyle;
+
+            const onKeydown = (e) => {
+                // 避免影响后台输入框中的打字
+                if (e.target.matches && e.target.matches('input, textarea, select')) return;
+                if (e.key === 'a' || e.key === 'A') { e.preventDefault(); cleanup('csv'); }
+                else if (e.key === 'b' || e.key === 'B') { e.preventDefault(); cleanup('json'); }
+                else if (e.key === 'Escape' || e.key === 'Esc') { cleanup(null); }
+            };
+
+            const cleanup = (result) => {
+                document.removeEventListener('keydown', onKeydown);
+                overlay.remove();
+                resolve(result);
+            };
+
+            btnCsv.addEventListener('click', () => cleanup('csv'));
+            btnJson.addEventListener('click', () => cleanup('json'));
+            overlay.addEventListener('click', (e) => {
+                if (e.target === overlay) cleanup(null);
+            });
+            box.addEventListener('click', (e) => e.stopPropagation());
+
+            document.addEventListener('keydown', onKeydown);
+            box.appendChild(titleEl);
+            box.appendChild(hintEl);
+            box.appendChild(btnCsv);
+            box.appendChild(btnJson);
+            overlay.appendChild(box);
+            document.body.appendChild(overlay);
+        });
+    }
+
+    // 共享导出流程：选择格式 → 进度框 → 收集 → 下载
+    async function exportUsersFlow({ label, getUsers }) {
+        const format = await askExportFormat('导出' + label);
+        if (!format) return; // 取消：连进度框都不创建
+
+        const infoDiv = document.createElement('div');
+        infoDiv.style.cssText = getInfoDivStyle();
+        document.body.appendChild(infoDiv);
+
+        const logArea = document.createElement('div');
+        logArea.style.cssText = 'flex: 1; overflow-y: auto; white-space: pre-wrap; padding-bottom: 8px;';
+        infoDiv.appendChild(logArea);
+
+        const btnContainer = document.createElement('div');
+        btnContainer.style.textAlign = 'center';
+        const closeBtn = document.createElement('button');
+        closeBtn.textContent = '关闭';
+        closeBtn.style.padding = '4px 16px';
+        btnContainer.appendChild(closeBtn);
+        infoDiv.appendChild(btnContainer);
+
+        function appendLog(html) {
+            logArea.innerHTML += html + '<br>';
+            logArea.scrollTop = logArea.scrollHeight;
+        }
+        closeBtn.addEventListener('click', () => infoDiv.remove());
+
+        appendLog(`正在导出${label}...`);
+        let users = [];
+        try {
+            users = await getUsers(appendLog);
+        } catch (e) {
+            appendLog('导出失败：' + e.message);
+            console.error('导出失败:', e);
+            return;
+        }
+
+        if (!users || users.length === 0) {
+            appendLog('没有可导出的用户。');
+            return;
+        }
+
+        const ext = format === 'csv' ? 'csv' : 'json';
+        const filename = `zhihu_${label}_${exportTimestamp()}.${ext}`;
+        if (format === 'csv') {
+            downloadFile(filename, toCsv(users), 'text/csv;charset=utf-8');
+        } else {
+            downloadFile(filename, toJson(users), 'application/json;charset=utf-8');
+        }
+        appendLog(`导出完成：共 ${users.length} 人，文件 ${filename}`);
+    }
+
+    // ---------- 导出入口：点赞用户（回答/文章页） ----------
+    async function exportUpvoters() {
+        const pageHref = location.href;
+        let apiCandidates = [];
+
+        const answerMatch = pageHref.match(/^https:\/\/www\.zhihu\.com\/question\/(\d+)\/answer\/(\d+)/);
+        const articleMatch = pageHref.match(/^https:\/\/zhuanlan\.zhihu\.com\/p\/(\d+)/);
+
+        if (answerMatch) {
+            // 两个排序：default（按粉丝量）和 newest（按点赞时间），合并去重
+            apiCandidates = [
+                `https://www.zhihu.com/api/v4/answers/${answerMatch[2]}/upvoters?order=default`,
+                `https://www.zhihu.com/api/v4/answers/${answerMatch[2]}/upvoters?order=newest`
+            ];
+        } else if (articleMatch) {
+            apiCandidates = [
+                `https://www.zhihu.com/api/v4/articles/${articleMatch[1]}/voters?order=default`,
+                `https://www.zhihu.com/api/v4/articles/${articleMatch[1]}/voters?order=newest`,
+                `https://www.zhihu.com/api/v4/articles/${articleMatch[1]}/likers?order=default`,
+                `https://www.zhihu.com/api/v4/articles/${articleMatch[1]}/likers?order=newest`
+            ];
+        } else {
+            alert('当前页面不是知乎回答或文章，无法导出点赞用户。');
+            return;
+        }
+
+        await exportUsersFlow({
+            label: '点赞用户',
+            getUsers: (log) => collectUsersPaged(apiCandidates, log)
+        });
+    }
+
+    // ---------- 导出入口：关注答主的用户（回答/文章页） ----------
+    async function exportAuthorFollowers() {
+        const pageHref = location.href;
+        let authorId = null;
+
+        const answerMatch = pageHref.match(/^https:\/\/www\.zhihu\.com\/question\/(\d+)\/answer\/(\d+)/);
+        const articleMatch = pageHref.match(/^https:\/\/zhuanlan\.zhihu\.com\/p\/(\d+)/);
+
+        if (answerMatch) {
+            try {
+                const answerApi = `https://www.zhihu.com/api/v4/answers/${answerMatch[2]}`;
+                const resp = await fetchWithCreds(answerApi);
+                const data = await safeJson(resp);
+                if (data && data.author && data.author.url_token) {
+                    authorId = data.author.url_token;
+                } else {
+                    alert('无法获取回答作者信息。');
+                    return;
+                }
+            } catch (e) {
+                alert('获取回答作者失败：' + e.message);
+                return;
+            }
+        } else if (articleMatch) {
+            try {
+                const articleApi = `https://www.zhihu.com/api/v4/articles/${articleMatch[1]}`;
+                const resp = await fetchWithCreds(articleApi);
+                const data = await safeJson(resp);
+                if (data && data.author && data.author.url_token) {
+                    authorId = data.author.url_token;
+                } else {
+                    alert('无法获取文章作者信息。');
+                    return;
+                }
+            } catch (e) {
+                alert('获取文章作者失败：' + e.message);
+                return;
+            }
+        } else {
+            alert('当前页面不是知乎回答或文章，无法导出关注答主的用户。');
+            return;
+        }
+
+        await exportUsersFlow({
+            label: '答主粉丝',
+            getUsers: (log) => collectUsersPaged([`https://www.zhihu.com/api/v4/members/${authorId}/followers`], log)
+        });
+    }
+
+    // ---------- 导出入口：自身黑名单用户 ----------
+    async function exportBlockedUsers() {
+        const me = await getCurrentUserId();
+        if (!me) {
+            alert('无法获取你的用户ID，请重新登录后重试。');
+            return;
+        }
+
+        await exportUsersFlow({
+            label: '黑名单用户',
+            getUsers: async (log) => {
+                // 优先从知乎 API 拉取真实黑名单
+                const remote = await fetchZhihuBlockedList(me);
+                if (remote && remote.length > 0) {
+                    return remote.filter(u => u.url_token).map(u => normalizeExportUser(u));
+                }
+                // 兜底：本地黑名单记录（键名为 token）
+                return loadBlockedUsers()
+                    .filter(u => u.token)
+                    .map(u => normalizeExportUser({ url_token: u.token, name: u.name }));
+            }
+        });
+    }
+
+    // ---------- 导出入口：关注我的用户（我的粉丝） ----------
+    async function exportMyFollowers() {
+        const me = await getCurrentUserId();
+        if (!me) {
+            alert('无法获取你的用户ID，请重新登录后重试。');
+            return;
+        }
+        await exportUsersFlow({
+            label: '我的粉丝',
+            getUsers: (log) => collectUsersPaged([`https://www.zhihu.com/api/v4/members/${me}/followers`], log)
+        });
+    }
+
+    // ---------- 导出入口：我关注的用户 ----------
+    async function exportMyFollowees() {
+        const me = await getCurrentUserId();
+        if (!me) {
+            alert('无法获取你的用户ID，请重新登录后重试。');
+            return;
+        }
+        await exportUsersFlow({
+            label: '我的关注',
+            getUsers: (log) => collectUsersPaged([`https://www.zhihu.com/api/v4/members/${me}/followees`], log)
+        });
+    }
+
     // ---------- 创建悬浮按钮和菜单 ----------
     function createUI() {
         const floatBtn = document.createElement('div');
@@ -1229,6 +1643,14 @@
             blockAuthorFollowers();
         });
 
+        menu.appendChild(item1);
+        menu.appendChild(item2);
+
+        // —— 二级菜单「知乎网页版美化」（样式与主菜单一致） ——
+        const subMenu = document.createElement('div');
+        subMenu.style.cssText = menu.style.cssText;
+
+        // —— 深色模式切换 ——
         const item3 = document.createElement('div');
         const initialThemeMode = getThemeMode();
         item3.textContent = initialThemeMode === 'dark' ? '浅色模式' : '深色模式';
@@ -1236,14 +1658,11 @@
         item3.addEventListener('mouseenter', () => { item3.style.backgroundColor = isDark ? '#3d3d3d' : '#f0f0f0'; });
         item3.addEventListener('mouseleave', () => { item3.style.backgroundColor = 'transparent'; });
         item3.addEventListener('click', () => {
-            menu.style.display = 'none';
+            subMenu.style.display = 'none';
             const nextMode = getThemeMode() === 'dark' ? 'light' : 'dark';
             setThemeMode(nextMode);
         });
-
-        menu.appendChild(item1);
-        menu.appendChild(item2);
-        menu.appendChild(item3);
+        subMenu.appendChild(item3);
 
         // —— 知乎直答处理设置 ——
         const currentZhidaMode = getZhidaMode();
@@ -1253,7 +1672,7 @@
         itemZhida.addEventListener('mouseenter', () => { itemZhida.style.backgroundColor = isDark ? '#3d3d3d' : '#f0f0f0'; });
         itemZhida.addEventListener('mouseleave', () => { itemZhida.style.backgroundColor = 'transparent'; });
         itemZhida.addEventListener('click', () => {
-            menu.style.display = 'none';
+            subMenu.style.display = 'none';
             const current = getZhidaMode();
             const idx = zhidaModeCycle.indexOf(current);
             const next = zhidaModeCycle[(idx + 1) % zhidaModeCycle.length];
@@ -1262,7 +1681,20 @@
             // 如果当前页面有 zhida 链接，立即应用新设置
             applyZhidaMode(next);
         });
-        menu.appendChild(itemZhida);
+        subMenu.appendChild(itemZhida);
+
+        // —— 超链接美化开关 ——
+        const itemLink = document.createElement('div');
+        itemLink.textContent = `超链接美化: ${linkBeautifyEnabled ? '开' : '关'}`;
+        itemLink.style.cssText = `padding: 8px 16px; cursor: pointer; color: ${isDark ? '#e0e0e0' : '#000'};`;
+        itemLink.addEventListener('mouseenter', () => { itemLink.style.backgroundColor = isDark ? '#3d3d3d' : '#f0f0f0'; });
+        itemLink.addEventListener('mouseleave', () => { itemLink.style.backgroundColor = 'transparent'; });
+        itemLink.addEventListener('click', () => {
+            subMenu.style.display = 'none';
+            const enabled = toggleLinkBeautify();
+            itemLink.textContent = `超链接美化: ${enabled ? '开' : '关'}`;
+        });
+        subMenu.appendChild(itemLink);
 
         // —— 专栏优化入口（仅 zhuanlan.zhihu.com） ——
         if (location.hostname === 'zhuanlan.zhihu.com') {
@@ -1273,24 +1705,85 @@
             item4.addEventListener('mouseenter', () => { item4.style.backgroundColor = isDark ? '#3d3d3d' : '#f0f0f0'; });
             item4.addEventListener('mouseleave', () => { item4.style.backgroundColor = 'transparent'; });
             item4.addEventListener('click', () => {
-                menu.style.display = 'none';
+                subMenu.style.display = 'none';
                 toggleZhuanlanOptimize();
                 item4.textContent = zhuanlanSavedState ? '专栏优化 ✓' : '优化专栏阅读';
             });
-            menu.appendChild(item4);
+            subMenu.appendChild(item4);
         }
+
+        // —— 二级菜单「导出用户」 ——
+        const exportSubMenu = document.createElement('div');
+        exportSubMenu.style.cssText = menu.style.cssText;
+
+        // 创建导出菜单项（复用统一 item 样式与 hover 逻辑）
+        function createExportItem(text, handler) {
+            const item = document.createElement('div');
+            item.textContent = text;
+            item.style.cssText = `padding: 8px 16px; cursor: pointer; color: ${isDark ? '#e0e0e0' : '#000'};`;
+            item.addEventListener('mouseenter', () => { item.style.backgroundColor = isDark ? '#3d3d3d' : '#f0f0f0'; });
+            item.addEventListener('mouseleave', () => { item.style.backgroundColor = 'transparent'; });
+            item.addEventListener('click', () => {
+                exportSubMenu.style.display = 'none';
+                handler();
+            });
+            return item;
+        }
+
+        exportSubMenu.appendChild(createExportItem('导出点赞用户', exportUpvoters));
+        exportSubMenu.appendChild(createExportItem('导出关注答主的用户', exportAuthorFollowers));
+        exportSubMenu.appendChild(createExportItem('导出自身黑名单用户', exportBlockedUsers));
+        exportSubMenu.appendChild(createExportItem('导出关注我的用户', exportMyFollowers));
+        exportSubMenu.appendChild(createExportItem('导出我关注的用户', exportMyFollowees));
+
+        document.body.appendChild(exportSubMenu);
+
+        document.body.appendChild(subMenu);
+
+        // —— 主菜单：二级菜单入口 ——
+        const itemSub = document.createElement('div');
+        itemSub.textContent = '知乎网页版美化 ›';
+        itemSub.style.cssText = `padding: 8px 16px; cursor: pointer; color: ${isDark ? '#e0e0e0' : '#000'}; border-top: 1px solid ${isDark ? '#555' : '#e0e0e0'}; margin-top: 4px; padding-top: 12px;`;
+        itemSub.addEventListener('mouseenter', () => { itemSub.style.backgroundColor = isDark ? '#3d3d3d' : '#f0f0f0'; });
+        itemSub.addEventListener('mouseleave', () => { itemSub.style.backgroundColor = 'transparent'; });
+        itemSub.addEventListener('click', () => {
+            menu.style.display = 'none';
+            subMenu.style.display = 'block';
+        });
+        menu.appendChild(itemSub);
+
+        // —— 主菜单：导出用户二级菜单入口 ——
+        const itemExport = document.createElement('div');
+        itemExport.textContent = '导出用户 ›';
+        itemExport.style.cssText = `padding: 8px 16px; cursor: pointer; color: ${isDark ? '#e0e0e0' : '#000'}; border-top: 1px solid ${isDark ? '#555' : '#e0e0e0'}; margin-top: 4px; padding-top: 12px;`;
+        itemExport.addEventListener('mouseenter', () => { itemExport.style.backgroundColor = isDark ? '#3d3d3d' : '#f0f0f0'; });
+        itemExport.addEventListener('mouseleave', () => { itemExport.style.backgroundColor = 'transparent'; });
+        itemExport.addEventListener('click', () => {
+            menu.style.display = 'none';
+            exportSubMenu.style.display = 'block';
+        });
+        menu.appendChild(itemExport);
 
         document.body.appendChild(menu);
 
         floatBtn.addEventListener('click', (e) => {
             e.stopPropagation();
+            // 二级菜单打开时点击 ⚙ 返回主菜单
+            if (subMenu.style.display === 'block' || exportSubMenu.style.display === 'block') {
+                subMenu.style.display = 'none';
+                exportSubMenu.style.display = 'none';
+                menu.style.display = 'block';
+                return;
+            }
             const isVisible = menu.style.display === 'block';
             menu.style.display = isVisible ? 'none' : 'block';
         });
 
         document.addEventListener('click', (e) => {
-            if (!menu.contains(e.target) && e.target !== floatBtn) {
+            if (!menu.contains(e.target) && !subMenu.contains(e.target) && !exportSubMenu.contains(e.target) && e.target !== floatBtn) {
                 menu.style.display = 'none';
+                subMenu.style.display = 'none';
+                exportSubMenu.style.display = 'none';
             }
         });
     }
@@ -1637,7 +2130,7 @@
             domHandlers.push(() => applyZhidaMode(savedZhidaMode));
         }
 
-        // —— 超链接美化 + 去除中转（自动应用，无需菜单） ——
+        // —— 超链接美化（可在菜单开关）+ 去除中转（自动应用） ——
         domHandlers.push(() => { applyLinkBeautify(); removeLinkRedirect(); });
 
         // 统一 MutationObserver：防抖批量执行所有 DOM 处理（替代原来多个独立 Observer）
