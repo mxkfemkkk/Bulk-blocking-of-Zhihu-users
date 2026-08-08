@@ -1,5 +1,9 @@
 # Bulk-blocking-of-Zhihu-users
 
+🎉 **好消息**：目前本项目已经上传到了[GreasyFork](https://greasyfork.org/zh-CN/scripts/588597-zhihu-plus-%E6%89%B9%E9%87%8F%E6%8B%89%E9%BB%91%E7%9F%A5%E4%B9%8E%E7%94%A8%E6%88%B7%E5%92%8C%E4%BC%98%E5%8C%96%E7%9F%A5%E4%B9%8E%E7%BD%91%E9%A1%B5%E7%89%88%E4%BD%BF%E7%94%A8%E4%BD%93%E9%AA%8C)，大家可以自由下载。*名称**：*Zhihu PLUS 批量拉黑知乎用户和优化知乎网页版使用体验* 🎉
+
+---
+
 > 碰到那些 ~~傻逼~~ 回答
 > 和一堆跟风点赞的人  
 > 想拉黑却又得一个一个点  
